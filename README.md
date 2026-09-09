@@ -44,7 +44,9 @@ first use.
   time point selected in the sequence browser.
 * **Labels**: the `labels` groups of a store load as label map volumes with
   the colours and names of their `image-label` metadata, or as Segmentation
-  nodes when that setting is on. A label store can also be dropped on its own.
+  nodes when that setting is on. A label store can also be dropped on its own,
+  and a plain integer store with few distinct values (a mask written without
+  `image-label` metadata) is loaded as a label map too.
 * **Time series**: the `t` axis loads as a Sequence with a browser, or as a
   single time point.
 * **Axes** `t`, `c`, `z`, `y`, `x` in any order. Channels become separate
@@ -59,8 +61,12 @@ first use.
   OME-Zarr, with RFC-4 orientation from the IJK→RAS matrix and `image-label`
   names and colours from the colour table or the segments.
 * **Stores**: local directories, `.ozx` files, `https://` and `s3://`, and
-  bioformats2raw containers (every image series is loaded). Writing targets a
-  local directory by design, as in ngff-zarr; upload it afterwards.
+  bioformats2raw containers (every image series is loaded). Public S3 buckets
+  are read anonymously when no AWS credentials are configured; other options
+  (region, endpoint, credentials) go in the module settings as JSON. Writing
+  targets a local directory by design, as in ngff-zarr; upload it afterwards.
+* **Memory**: volumes are read slab by slab straight into the VTK buffer, so a
+  volume is held once in memory, not twice.
 * **Progress and cancel** while reading.
 
 ## Still to do
