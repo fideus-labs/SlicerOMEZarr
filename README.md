@@ -37,8 +37,9 @@ first use.
   the module settings. A message says which level was chosen.
 * **Refine current view**: reloads the block shown by a slice view at the
   finest level that fits the budget, reading only the chunks it needs, and
-  overlays it on the coarse volume. Region-of-interest loading does the same
-  for a Markups ROI.
+  overlays it on the coarse volume. It can run automatically each time the
+  view stops moving. Region-of-interest loading does the same for a Markups
+  ROI.
 * **Labels**: the `labels` groups of a store load as label map volumes with
   the colours and names of their `image-label` metadata. A label store can
   also be dropped on its own.
@@ -52,9 +53,9 @@ first use.
   Without RFC-4 metadata the axes are assumed LPS (the ngff-zarr and ITK
   convention) or RAS, per the module settings, and the load log says so.
 * **Display units**: optionally shows lengths in the store's unit (µm, nm).
-* **Writing**: scalar and label map volumes as multiscale OME-Zarr, with
-  RFC-4 orientation from the IJK→RAS matrix and `image-label` colours from the
-  colour table.
+* **Writing**: scalar volumes, label maps and segmentations as multiscale
+  OME-Zarr, with RFC-4 orientation from the IJK→RAS matrix and `image-label`
+  names and colours from the colour table or the segments.
 * **Stores**: local directories, `.ozx` files, `https://` and `s3://`.
 * **Progress and cancel** while reading.
 
@@ -64,10 +65,9 @@ first use.
   store, and `slicer.util.saveNode` ignores a requested file type. Both need
   changes in Slicer core (tracked in issue #1); use drag-and-drop, the
   `zarr.json` file, or the save dialog meanwhile.
-* Automatic refinement while panning and zooming.
-* Segmentation nodes written directly, without exporting to a label map.
-* Writing to remote stores.
-* Tests on macOS and Windows, submission to the Extensions Index.
+* Writing to remote stores (ngff-zarr writes local directories only).
+* Loading labels as Segmentation nodes rather than label maps.
+* Submission to the Extensions Index once the repository is public.
 
 ## Development
 
@@ -77,4 +77,5 @@ Testing/run_headless_test.sh /path/to/Slicer                       # module self
 OMEZARR_TEST_REMOTE=1 Testing/run_headless_test.sh /path/to/Slicer # also test an IDR HTTPS store
 ```
 
-The same self-test runs in GitHub Actions against the latest stable Slicer.
+The same self-test runs in GitHub Actions against the latest stable Slicer on
+Linux; the macOS and Windows jobs are informational.

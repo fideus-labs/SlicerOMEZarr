@@ -81,6 +81,7 @@ class Settings:
     LOAD_LABELS = "OMEZarr/LoadLabels"
     TIME_MODE = "OMEZarr/TimeMode"  # sequence or index
     DISPLAY_UNITS = "OMEZarr/DisplayUnits"  # switch Slicer's length display unit to the store's
+    AUTO_REFINE = "OMEZarr/AutoRefine"  # refine the Red view automatically after a store is loaded
 
     @staticmethod
     def get(key, default):
@@ -957,6 +958,30 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         )
         return nodes
 
+    # ---- automatic refinement ----
+
+    _autoRefiners = {}
+
+    @classmethod
+    def startAutoRefine(cls, path, sliceViewName="Red", delayMs=600, maxBytes=None):
+        """Refine ``sliceViewName`` whenever it stops moving. Returns the AutoRefiner."""
+        cls.stopAutoRefine(path)
+        refiner = AutoRefiner(str(path), sliceViewName, delayMs, maxBytes)
+        cls._autoRefiners[str(path)] = refiner
+        return refiner
+
+    @classmethod
+    def stopAutoRefine(cls, path=None):
+        keys = [str(path)] if path is not None else list(cls._autoRefiners)
+        for key in keys:
+            refiner = cls._autoRefiners.pop(key, None)
+            if refiner is not None:
+                refiner.stop()
+
+    @classmethod
+    def autoRefiner(cls, path):
+        return cls._autoRefiners.get(str(path))
+
     # ---- display units ----
 
     @staticmethod
@@ -1033,10 +1058,22 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @classmethod
     def writeVolume(cls, node, storePath, progress=None):
-        """Write a scalar or label map volume as an OME-Zarr multiscales store."""
+        """Write a scalar volume, label map or segmentation as an OME-Zarr multiscales store."""
         ngff_zarr = cls.ensureNgffZarr()
         from ngff_zarr import Methods
 
+        if isRemoteUrl(storePath):
+            raise ValueError("Writing to a remote store is not supported; write to a local directory and upload it.")
+        if node.IsA("vtkMRMLSegmentationNode"):
+            labelNode = cls.labelMapFromSegmentation(node)
+            try:
+                return cls.writeVolume(labelNode, storePath, progress)
+            finally:
+                display = labelNode.GetDisplayNode()
+                colorNode = display.GetColorNode() if display else None
+                slicer.mrmlScene.RemoveNode(labelNode)
+                if colorNode is not None:
+                    slicer.mrmlScene.RemoveNode(colorNode)
         isLabel = node.IsA("vtkMRMLLabelMapVolumeNode")
         image = cls.ngffImageFromVolumeNode(node)
         method = Methods.ITKWASM_LABEL_IMAGE if isLabel else None
@@ -1056,6 +1093,18 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if progress:
             progress(1, 1)
         return storePath
+
+    @staticmethod
+    def labelMapFromSegmentation(segmentationNode):
+        """Temporary label map (with a colour table of segment names and colours) of all segments."""
+        labelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", segmentationNode.GetName())
+        logic = slicer.modules.segmentations.logic()
+        if not logic.ExportAllSegmentsToLabelmapNode(
+            segmentationNode, labelNode, slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
+        ):
+            slicer.mrmlScene.RemoveNode(labelNode)
+            raise ValueError("Could not export the segmentation to a label map")
+        return labelNode
 
     @staticmethod
     def _updateGroupMetadata(groupPath, update):
@@ -1105,6 +1154,71 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             ome["labels"] = [*names, name]
 
         cls._updateGroupMetadata(labelsDir, update)
+
+
+class AutoRefiner:
+    """Reloads the block a slice view shows once the view has been still for ``delayMs``.
+
+    Observes the slice node; each change restarts the timer, so nothing loads while the
+    user pans or zooms. A refresh is skipped when the view bounds did not change.
+    """
+
+    def __init__(self, path, sliceViewName, delayMs, maxBytes):
+        self.path = path
+        self.sliceViewName = sliceViewName
+        self.maxBytes = maxBytes
+        self.lastBounds = None
+        self.busy = False
+        self.refreshCount = 0
+        self.timer = qt.QTimer()
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(int(delayMs))
+        self.timer.timeout.connect(self.refresh)
+        sliceWidget = slicer.app.layoutManager().sliceWidget(sliceViewName)
+        if sliceWidget is None:
+            raise ValueError(f"No slice view named '{sliceViewName}'")
+        self.sliceNode = sliceWidget.mrmlSliceNode()
+        self.observerTag = self.sliceNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onSliceModified)
+        self.sceneObserverTag = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.EndCloseEvent, self.onSceneClosed)
+        self.timer.start()
+
+    def stop(self):
+        self.timer.stop()
+        if self.observerTag is not None:
+            self.sliceNode.RemoveObserver(self.observerTag)
+            self.observerTag = None
+        if self.sceneObserverTag is not None:
+            slicer.mrmlScene.RemoveObserver(self.sceneObserverTag)
+            self.sceneObserverTag = None
+
+    def onSceneClosed(self, caller=None, event=None):
+        OMEZarrLogic.stopAutoRefine(self.path)
+
+    def onSliceModified(self, caller=None, event=None):
+        if not self.busy:
+            self.timer.start()
+
+    def refresh(self):
+        if self.busy:
+            self.timer.start()
+            return
+        try:
+            bounds = OMEZarrLogic.sliceViewRasBounds(self.sliceViewName)
+        except ValueError:
+            return
+        if self.lastBounds is not None and np.allclose(bounds, self.lastBounds, rtol=0.0, atol=1e-6):
+            return
+        self.busy = True
+        try:
+            OMEZarrLogic.refineView(self.path, self.sliceViewName, maxBytes=self.maxBytes)
+            self.refreshCount += 1
+        except (ValueError, InterruptedError) as e:
+            logging.debug(f"Auto-refine skipped: {e}")
+        except Exception:  # noqa: BLE001 - never let a timer callback raise into Qt
+            logging.exception("Auto-refine failed")
+        finally:
+            self.lastBounds = bounds
+            self.busy = False
 
 
 #
@@ -1177,6 +1291,9 @@ class OMEZarrFileReader:
                 label=labels[0] if labels else "keep-current",
                 fit=True,
             )
+            coarse = any(n.GetAttribute("OMEZarr.Level") not in (None, "0") for n in scalars)
+            if coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
+                OMEZarrLogic.startAutoRefine(root)
         self.parent.loadedNodes = [node.GetID() for node in nodes]
         return True
 
@@ -1201,8 +1318,12 @@ class OMEZarrFileWriter:
         return [_("OME-Zarr") + " (.ome.zarr)", _("OME-Zarr directory") + " (*)"]
 
     def canWriteObjectConfidence(self, obj):
-        # Below the default 0.5 so NRRD stays the default choice in the save dialog.
-        if obj.IsA("vtkMRMLLabelMapVolumeNode") or obj.IsA("vtkMRMLScalarVolumeNode"):
+        # Below the default 0.5 so the native formats stay the default choice in the save dialog.
+        if (
+            obj.IsA("vtkMRMLLabelMapVolumeNode")
+            or obj.IsA("vtkMRMLScalarVolumeNode")
+            or obj.IsA("vtkMRMLSegmentationNode")
+        ):
             return 0.3
         return 0.0
 
@@ -1334,6 +1455,10 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         )
         refineLayout.addRow(self.refineButton)
 
+        self.autoRefineCheckBox = qt.QCheckBox(_("Refine automatically while browsing this view"))
+        self.autoRefineCheckBox.setToolTip(_("Reloads the block after the view has been still for half a second"))
+        refineLayout.addRow(self.autoRefineCheckBox)
+
         self.roiSelector = slicer.qMRMLNodeComboBox()
         self.roiSelector.nodeTypes = ["vtkMRMLMarkupsROINode"]
         self.roiSelector.addEnabled = True
@@ -1382,6 +1507,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.displayUnitsCheckBox.setToolTip(_("Show lengths in the store's unit (µm, nm) instead of mm"))
         settingsLayout.addRow(_("Display in store units:"), self.displayUnitsCheckBox)
 
+        self.autoRefineOnLoadCheckBox = qt.QCheckBox()
+        self.autoRefineOnLoadCheckBox.checked = Settings.get(Settings.AUTO_REFINE, False)
+        self.autoRefineOnLoadCheckBox.setToolTip(
+            _("After loading a downsampled level, refine the Red view automatically")
+        )
+        settingsLayout.addRow(_("Auto-refine after load:"), self.autoRefineOnLoadCheckBox)
+
         self.resetUnitsButton = qt.QPushButton(_("Reset display to mm"))
         settingsLayout.addRow(self.resetUnitsButton)
 
@@ -1390,6 +1522,8 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.inspectButton.connect("clicked(bool)", self.onInspect)
         self.loadButton.connect("clicked(bool)", self.onLoad)
         self.refineButton.connect("clicked(bool)", self.onRefine)
+        self.autoRefineCheckBox.connect("toggled(bool)", self.onAutoRefineToggled)
+        self.viewSelector.connect("currentTextChanged(QString)", self.onViewChanged)
         self.loadRegionButton.connect("clicked(bool)", self.onLoadRegion)
         self.levelSelector.connect("currentIndexChanged(int)", self.onLevelChanged)
         self.maxBytesSpinBox.connect("valueChanged(int)", lambda mib: Settings.set(Settings.MAX_BYTES, int(mib) << 20))
@@ -1400,6 +1534,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         )
         self.displayUnitsCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.DISPLAY_UNITS, bool(b)))
         self.resetUnitsButton.connect("clicked(bool)", OMEZarrLogic.resetDisplayUnits)
+        self.autoRefineOnLoadCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.AUTO_REFINE, bool(b)))
 
     def currentPath(self):
         if not self.path:
@@ -1479,6 +1614,24 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             except InterruptedError:
                 pass
 
+    def onAutoRefineToggled(self, enabled):
+        if not enabled:
+            if self.path:
+                OMEZarrLogic.stopAutoRefine(self.path)
+            return
+        if not self.currentPath():
+            self.autoRefineCheckBox.checked = False
+            return
+        with slicer.util.tryWithErrorDisplay(_("Failed to start automatic refinement")):
+            OMEZarrLogic.startAutoRefine(self.path, self.viewSelector.currentText)
+
+    def onViewChanged(self, viewName):
+        if self.autoRefineCheckBox.checked and self.path:
+            OMEZarrLogic.startAutoRefine(self.path, viewName)
+
+    def cleanup(self):
+        OMEZarrLogic.stopAutoRefine()
+
     def onLoadRegion(self):
         roiNode = self.roiSelector.currentNode()
         if roiNode is None:
@@ -1521,6 +1674,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 Settings.LOAD_LABELS,
                 Settings.TIME_MODE,
                 Settings.DISPLAY_UNITS,
+                Settings.AUTO_REFINE,
             )
         }
         for key in self.savedSettings:
@@ -1529,6 +1683,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
     def tearDown(self):
         import shutil
 
+        OMEZarrLogic.stopAutoRefine()
         shutil.rmtree(self.tempDir, ignore_errors=True)
         for key, value in self.savedSettings.items():
             if value is None:
@@ -1549,6 +1704,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_TimeSeries()
             self.test_Writer()
             self.test_RefineView()
+            self.test_AutoRefine()
+            self.test_SegmentationWriter()
             self.test_Settings()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
@@ -1883,6 +2040,96 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             ),
             1,
         )
+
+    @staticmethod
+    def waitFor(condition, timeoutSeconds=10.0):
+        import time
+
+        deadline = time.time() + timeoutSeconds
+        while time.time() < deadline:
+            slicer.app.processEvents()
+            if condition():
+                return True
+            time.sleep(0.05)
+        return condition()
+
+    def test_AutoRefine(self):
+        self.delayDisplay("Automatic refinement follows the Red view")
+        mrHead, storePath = self.writeMRHeadStore()
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4
+        coarse = OMEZarrLogic.loadImage(storePath, maxBytes=budget)[0]
+        slicer.util.setSliceViewerLayers(background=coarse, fit=True)
+        sliceNode = slicer.app.layoutManager().sliceWidget("Red").mrmlSliceNode()
+        sliceNode.SetOrientationToAxial()
+        bounds = [0.0] * 6
+        mrHead.GetRASBounds(bounds)
+        center = [(bounds[0] + bounds[1]) / 2, (bounds[2] + bounds[3]) / 2, (bounds[4] + bounds[5]) / 2]
+        sliceNode.JumpSliceByCentering(*center)
+        sliceNode.SetFieldOfView(40.0, 40.0, 1.0)
+
+        def refined():
+            return [
+                n for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode") if n.GetAttribute("OMEZarr.Refined")
+            ]
+
+        refiner = OMEZarrLogic.startAutoRefine(storePath, "Red", delayMs=200, maxBytes=budget)
+        self.assertTrue(self.waitFor(lambda: refiner.refreshCount == 1))
+        first = refined()
+        self.assertEqual(len(first), 1)
+        firstOrigin = np.array(first[0].GetOrigin())
+
+        # A still view does not reload.
+        self.assertFalse(self.waitFor(lambda: refiner.refreshCount > 1, timeoutSeconds=1.0))
+
+        # Panning reloads once the view is still again, replacing the previous block.
+        sliceNode.JumpSliceByCentering(center[0] + 25.0, center[1], center[2])
+        self.assertTrue(self.waitFor(lambda: refiner.refreshCount == 2))
+        second = refined()
+        self.assertEqual(len(second), 1)
+        self.assertGreater(np.abs(np.array(second[0].GetOrigin()) - firstOrigin).max(), 10.0)
+
+        OMEZarrLogic.stopAutoRefine(storePath)
+        self.assertIsNone(OMEZarrLogic.autoRefiner(storePath))
+        sliceNode.JumpSliceByCentering(center[0] - 25.0, center[1], center[2])
+        self.assertFalse(self.waitFor(lambda: refiner.refreshCount > 2, timeoutSeconds=1.0))
+
+    def test_SegmentationWriter(self):
+        self.delayDisplay("A segmentation is written as a label store with segment names and colours")
+        import SampleData
+
+        mrHead = SampleData.SampleDataLogic().downloadMRHead()
+        labelArray = np.zeros(slicer.util.arrayFromVolume(mrHead).shape, dtype=np.uint8)
+        labelArray[40:80, 100:150, 100:160] = 1
+        labelArray[20:30, 50:70, 60:90] = 2
+        labelNode = slicer.util.addVolumeFromArray(
+            labelArray, ijkToRAS=self.ijkToRasArray(mrHead), name="seed", nodeClassName="vtkMRMLLabelMapVolumeNode"
+        )
+        segmentation = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "brain")
+        segmentation.SetReferenceImageGeometryParameterFromVolumeNode(mrHead)
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(labelNode, segmentation)
+        slicer.mrmlScene.RemoveNode(labelNode)
+        segments = segmentation.GetSegmentation()
+        segments.GetNthSegment(0).SetName("cortex")
+        segments.GetNthSegment(0).SetColor(0.9, 0.1, 0.1)
+        segments.GetNthSegment(1).SetName("ventricle")
+        segments.GetNthSegment(1).SetColor(0.1, 0.1, 0.9)
+
+        storePath = os.path.join(self.tempDir, "brain.ome.zarr")
+        labelMapsBefore = len(slicer.util.getNodesByClass("vtkMRMLLabelMapVolumeNode"))
+        self.assertTrue(self.saveAsOmeZarr(segmentation, storePath))
+        self.assertTrue(isLabelStore(storePath))
+        # The temporary export is removed again.
+        self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLLabelMapVolumeNode")), labelMapsBefore)
+        imageLabel = readStoreAttributes(storePath)["image-label"]
+        self.assertEqual([p["name"] for p in imageLabel["properties"]], ["cortex", "ventricle"])
+        self.assertEqual(imageLabel["colors"][1]["rgba"][:3], [26, 26, 230])
+
+        OMEZarrLogic.clearCache()
+        loaded = slicer.util.loadNodeFromFile(storePath, "OMEZarr")
+        self.assertTrue(loaded.IsA("vtkMRMLLabelMapVolumeNode"))
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(loaded), labelArray)
+        self.assertEqual(loaded.GetDisplayNode().GetColorNode().GetColorName(2), "ventricle")
 
     def test_Settings(self):
         self.delayDisplay("Display units follow the store when enabled")
