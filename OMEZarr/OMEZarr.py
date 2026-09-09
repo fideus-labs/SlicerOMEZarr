@@ -135,6 +135,18 @@ def isRemoteUrl(path):
     return bool(re.match(r"^(https?|s3|gs|gcs|az|abfs)://", str(path)))
 
 
+def normalizeStorePath(path):
+    """Canonical form of a store path for node attributes and comparisons (URLs unchanged)."""
+    path = str(path)
+    if isRemoteUrl(path):
+        return path.rstrip("/")
+    return os.path.normpath(os.path.abspath(path))
+
+
+def samePath(a, b):
+    return a is not None and b is not None and normalizeStorePath(a) == normalizeStorePath(b)
+
+
 def joinStorePath(root, *parts):
     root = str(root).rstrip("/")
     return "/".join([root, *parts]) if isRemoteUrl(root) else os.path.join(root, *parts)
@@ -682,7 +694,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def setNodeAttributes(node, path, level, dims, timeIndex, channelIndex, lengthUnit, orientationSource, region):
-        node.SetAttribute("OMEZarr.Path", str(path))
+        node.SetAttribute("OMEZarr.Path", normalizeStorePath(path))
         node.SetAttribute("OMEZarr.Level", str(level))
         node.SetAttribute("OMEZarr.Dims", ",".join(dims))
         node.SetAttribute("OMEZarr.TimeIndex", str(timeIndex))
@@ -1107,7 +1119,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         """Selected item of the sequence browser showing this store, else 0."""
         for browser in slicer.util.getNodesByClass("vtkMRMLSequenceBrowserNode"):
             master = browser.GetMasterSequenceNode()
-            if master is not None and master.GetAttribute("OMEZarr.Path") == str(path):
+            if master is not None and samePath(master.GetAttribute("OMEZarr.Path"), path):
                 return max(0, browser.GetSelectedItemNumber())
         return 0
 
@@ -1121,7 +1133,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 node is not None
                 and node.IsA("vtkMRMLScalarVolumeNode")
                 and not node.IsA("vtkMRMLLabelMapVolumeNode")
-                and node.GetAttribute("OMEZarr.Path") == str(path)
+                and samePath(node.GetAttribute("OMEZarr.Path"), path)
                 and node.GetAttribute("OMEZarr.Channel") == str(channel)
                 and not node.GetAttribute("OMEZarr.Refined")
                 and not node.GetAttribute("OMEZarr.Region")
@@ -1157,7 +1169,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             n
             for n in nodes
             if n.GetAttribute("OMEZarr.Refined") == "1"
-            and (path is None or n.GetAttribute("OMEZarr.Path") == str(path))
+            and (path is None or samePath(n.GetAttribute("OMEZarr.Path"), path))
             and (sliceViewName is None or n.GetAttribute("OMEZarr.RefinedView") == sliceViewName)
         ]
 
@@ -2087,7 +2099,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         # Automatic detection without an explicit file type.
         loadedAuto = slicer.util.loadNodeFromFile(storePath)
         self.assertIsNotNone(loadedAuto)
-        self.assertEqual(os.path.normpath(loadedAuto.GetAttribute("OMEZarr.Path")), os.path.normpath(storePath))
+        self.assertTrue(samePath(loadedAuto.GetAttribute("OMEZarr.Path"), storePath))
 
     def test_LevelSelection(self):
         self.delayDisplay("Multiscale level selection by memory budget")
@@ -2485,7 +2497,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         segments = segmentation.GetSegmentation()
         self.assertEqual(segments.GetNumberOfSegments(), 2)
         self.assertEqual(sorted(segments.GetNthSegment(i).GetName() for i in range(2)), ["cytoplasm", "nucleus"])
-        self.assertEqual(segmentation.GetAttribute("OMEZarr.Path"), labelPath)
+        self.assertTrue(samePath(segmentation.GetAttribute("OMEZarr.Path"), labelPath))
         exported = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "check")
         slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
             segmentation, exported, slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
