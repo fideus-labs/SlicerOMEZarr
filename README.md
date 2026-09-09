@@ -59,7 +59,8 @@ first use.
   OME-Zarr, with RFC-4 orientation from the IJK→RAS matrix and `image-label`
   names and colours from the colour table or the segments.
 * **Stores**: local directories, `.ozx` files, `https://` and `s3://`, and
-  bioformats2raw containers (every image series is loaded).
+  bioformats2raw containers (every image series is loaded). Writing targets a
+  local directory by design, as in ngff-zarr; upload it afterwards.
 * **Progress and cancel** while reading.
 
 ## Still to do
@@ -68,7 +69,6 @@ first use.
   store, and `slicer.util.saveNode` ignores a requested file type. Both need
   changes in Slicer core (tracked in issue #1); use drag-and-drop, the
   `zarr.json` file, or the save dialog meanwhile.
-* Writing to remote stores (ngff-zarr writes local directories only).
 * Submission to the Extensions Index once the repository is public.
 
 ## Development
