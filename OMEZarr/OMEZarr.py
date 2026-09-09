@@ -2355,7 +2355,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             )
         OMEZarrLogic.clearCache()
 
-        self.assertEqual(omeZarrRootFromPath(root), root)
+        self.assertEqual(os.path.normpath(omeZarrRootFromPath(root)), os.path.normpath(root))
         self.assertTrue(isBioformats2rawRoot(root))
         self.assertEqual(len(bioformats2rawSeries(root)), 2)
         self.assertEqual(str(slicer.app.coreIOManager().fileType(root)), "OMEZarr")
