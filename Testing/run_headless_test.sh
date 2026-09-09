@@ -13,6 +13,6 @@ fi
 if command -v cygpath >/dev/null 2>&1; then
   HERE="$(cygpath -m "$HERE")"
 fi
-exec "${LAUNCHER[@]}" "$SLICER" --no-splash --testing \
+exec ${LAUNCHER[@]+"${LAUNCHER[@]}"} "$SLICER" --no-splash --testing \
   --additional-module-paths "$HERE/../OMEZarr" \
   --python-script "$HERE/run_module_test.py"

@@ -1771,7 +1771,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         # Automatic detection without an explicit file type.
         loadedAuto = slicer.util.loadNodeFromFile(storePath)
         self.assertIsNotNone(loadedAuto)
-        self.assertEqual(loadedAuto.GetAttribute("OMEZarr.Path"), storePath)
+        self.assertEqual(os.path.normpath(loadedAuto.GetAttribute("OMEZarr.Path")), os.path.normpath(storePath))
 
     def test_LevelSelection(self):
         self.delayDisplay("Multiscale level selection by memory budget")
