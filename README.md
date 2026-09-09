@@ -78,4 +78,4 @@ OMEZARR_TEST_REMOTE=1 Testing/run_headless_test.sh /path/to/Slicer # also test a
 ```
 
 The same self-test runs in GitHub Actions against the latest stable Slicer on
-Linux; the macOS and Windows jobs are informational.
+Linux, macOS and Windows.
