@@ -7,9 +7,11 @@ Reading and writing go through [ngff-zarr](https://github.com/fideus-labs/ngff-z
 I like working in Slicer, and until now I had to convert every mouse-brain
 OME-Zarr dataset to NIfTI just to look at it. This extension removes that step.
 
-![Screenshot](Screenshots/main.png)
+![Walkthrough: drop the store, refine a view, drop the mask](Screenshots/walkthrough.gif)
 
-Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
+Recorded on an ExaSPIM mouse brain (2.3 GB, 30 µm). Full video with
+captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4)
+(1 min 50). Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
 
 ## Usage
 

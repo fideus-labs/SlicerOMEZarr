@@ -1,5 +1,7 @@
 # Walkthrough
 
+Video with captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4).
+
 Recorded on an ExaSPIM mouse brain (`Volume.ome.zarr`, OME-Zarr 0.4,
 1775 × 1331 × 514 voxels at 30.08 × 30.08 × 40 µm, two levels: 2316 MiB and
 36 MiB, chunks 256³). The memory budget was set to 512 MiB so that the

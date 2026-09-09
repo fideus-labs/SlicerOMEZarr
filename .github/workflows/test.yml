@@ -3,9 +3,9 @@ name: test
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', '**.png']
+    paths-ignore: ['**.md', '**.png', '**.jpg', '**.gif', '**.mp4']
   pull_request:
-    paths-ignore: ['**.md', '**.png']
+    paths-ignore: ['**.md', '**.png', '**.jpg', '**.gif', '**.mp4']
   workflow_dispatch:
 
 jobs:
