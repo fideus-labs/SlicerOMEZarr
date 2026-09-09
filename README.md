@@ -1,19 +1,25 @@
 # SlicerOMEZarr
 
-Prototype [3D Slicer](https://slicer.org) extension that opens
-[OME-Zarr](https://ngff.openmicroscopy.org/) (OME-NGFF) images directly.
-Reading is done by [ngff-zarr](https://github.com/fideus-labs/ngff-zarr).
+[3D Slicer](https://slicer.org) extension that opens and saves
+[OME-Zarr](https://ngff.openmicroscopy.org/) (OME-NGFF) images.
+Reading and writing go through [ngff-zarr](https://github.com/fideus-labs/ngff-zarr).
 
 I like working in Slicer, and until now I had to convert every mouse-brain
 OME-Zarr dataset to NIfTI just to look at it. This extension removes that step.
+
+![Screenshot](Screenshots/main.png)
 
 ## Usage
 
 * Drag an `.ome.zarr` directory onto the Slicer window and pick
   "Load OME-Zarr image".
 * `File → Add Data` and select the store's `zarr.json`.
+* `File → Save`, choose the "OME-Zarr image" format for a scalar or label map
+  volume. Saving a label map into `<image>.ome.zarr/labels/<name>` registers
+  it as a label of that image.
 * The **OME-Zarr** module lists the resolution levels of a store, loads a
-  chosen level, or loads only the region under a Markups ROI.
+  chosen level, refines what a slice view shows, or loads the region under a
+  Markups ROI.
 * From Python:
 
   ```python
@@ -26,33 +32,42 @@ first use.
 
 ## What works
 
-* Multiscales: the finest level whose volume fits the memory budget is loaded
-  (1 GiB by default, adjustable in the module). A message says which level
-  was chosen.
-* Axes `t`, `c`, `z`, `y`, `x` in any order. Channels become separate volumes
-  named, coloured and windowed from the OMERO metadata. 2D images are loaded
-  as single-slice volumes.
-* Spacing and origin are converted from the axis units to millimetres. RFC-4
-  anatomical orientation becomes the IJK→RAS direction. Without RFC-4
-  metadata, `x`/`y`/`z` are treated as LPS axes, matching ngff-zarr's ITK
-  conversion, so Slicer → OME-Zarr → Slicer round trips are exact.
-* Local directories, `.ozx` files, `https://` and `s3://` stores.
-* Region-of-interest loading reads only the chunks that intersect the region,
-  at any level.
+* **Multiscales**: the finest level whose volumes fit the memory budget is
+  loaded. The budget defaults to a quarter of the free RAM and can be fixed in
+  the module settings. A message says which level was chosen.
+* **Refine current view**: reloads the block shown by a slice view at the
+  finest level that fits the budget, reading only the chunks it needs, and
+  overlays it on the coarse volume. Region-of-interest loading does the same
+  for a Markups ROI.
+* **Labels**: the `labels` groups of a store load as label map volumes with
+  the colours and names of their `image-label` metadata. A label store can
+  also be dropped on its own.
+* **Time series**: the `t` axis loads as a Sequence with a browser, or as a
+  single time point.
+* **Axes** `t`, `c`, `z`, `y`, `x` in any order. Channels become separate
+  volumes named, coloured and windowed from the OMERO metadata. 2D images are
+  loaded as single-slice volumes.
+* **Geometry**: spacing and origin are converted from the axis units to
+  millimetres. RFC-4 anatomical orientation becomes the IJK→RAS direction.
+  Without RFC-4 metadata the axes are assumed LPS (the ngff-zarr and ITK
+  convention) or RAS, per the module settings, and the load log says so.
+* **Display units**: optionally shows lengths in the store's unit (µm, nm).
+* **Writing**: scalar and label map volumes as multiscale OME-Zarr, with
+  RFC-4 orientation from the IJK→RAS matrix and `image-label` colours from the
+  colour table.
+* **Stores**: local directories, `.ozx` files, `https://` and `s3://`.
+* **Progress and cancel** while reading.
 
 ## Still to do
 
 * `Add Data → Choose Directory to Add` lists the chunk files instead of the
-  store. This needs a change in Slicer core; use drag-and-drop or the
-  `zarr.json` file meanwhile.
-* Time axis as a Sequence node. Only one time index is loaded today.
-* Writing volumes back to OME-Zarr.
-* Loading in the background with a progress bar.
-* Automatic level and region selection from the current view, for datasets
-  that do not fit in memory.
-* ngff-zarr should return RFC-4 orientation and channel names on read. The
-  extension reads the raw metadata for now.
-* Tests on macOS and Windows, CI, icon, submission to the Extensions Index.
+  store, and `slicer.util.saveNode` ignores a requested file type. Both need
+  changes in Slicer core (tracked in issue #1); use drag-and-drop, the
+  `zarr.json` file, or the save dialog meanwhile.
+* Automatic refinement while panning and zooming.
+* Segmentation nodes written directly, without exporting to a label map.
+* Writing to remote stores.
+* Tests on macOS and Windows, submission to the Extensions Index.
 
 ## Development
 
@@ -61,3 +76,5 @@ Slicer --additional-module-paths /path/to/SlicerOMEZarr/OMEZarr
 Testing/run_headless_test.sh /path/to/Slicer                       # module self-test under Xvfb
 OMEZARR_TEST_REMOTE=1 Testing/run_headless_test.sh /path/to/Slicer # also test an IDR HTTPS store
 ```
+
+The same self-test runs in GitHub Actions against the latest stable Slicer.

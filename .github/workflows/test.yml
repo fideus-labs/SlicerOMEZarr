@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  headless:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Slicer runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb libglu1-mesa libpulse-mainloop-glib0 \
+            libnss3 libasound2t64 libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-xkb1 libxkbcommon-x11-0 libxcb-cursor0 libegl1 libopengl0
+
+      - name: Cache Slicer
+        id: cache-slicer
+        uses: actions/cache@v4
+        with:
+          path: slicer
+          key: slicer-linux-stable-${{ runner.os }}-v1
+
+      - name: Download Slicer
+        if: steps.cache-slicer.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p slicer
+          curl -sSL "https://download.slicer.org/download?os=linux&stability=release" -o slicer.tar.gz
+          tar -xzf slicer.tar.gz -C slicer --strip-components=1
+          rm slicer.tar.gz
+
+      - name: Run module self-test
+        run: Testing/run_headless_test.sh "$PWD/slicer/Slicer"

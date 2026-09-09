@@ -7,9 +7,9 @@ project(SlicerOMEZarr)
 set(EXTENSION_HOMEPAGE "https://github.com/fideus-labs/SlicerOMEZarr")
 set(EXTENSION_CATEGORY "Informatics")
 set(EXTENSION_CONTRIBUTORS "Valentin Boussot (Fideus Labs), Matt McCormick (Fideus Labs)")
-set(EXTENSION_DESCRIPTION "Read OME-Zarr (OME-NGFF) images into 3D Slicer: multiscale level selection, spatial metadata and RFC-4 anatomical orientation mapped to RAS, region-of-interest loading from local or remote stores.")
+set(EXTENSION_DESCRIPTION "Read and write OME-Zarr (OME-NGFF) images in 3D Slicer: multiscale level selection by memory budget, labels, time series as sequences, RFC-4 anatomical orientation mapped to RAS, view-driven refinement and region-of-interest loading from local or remote stores.")
 set(EXTENSION_ICONURL "https://raw.githubusercontent.com/fideus-labs/SlicerOMEZarr/main/SlicerOMEZarr.png")
-set(EXTENSION_SCREENSHOTURLS "")
+set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/fideus-labs/SlicerOMEZarr/main/Screenshots/main.png")
 set(EXTENSION_DEPENDS "NA")
 
 #-----------------------------------------------------------------------------

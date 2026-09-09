@@ -1,24 +1,22 @@
 """OME-Zarr (OME-NGFF) support for 3D Slicer.
 
-Experimental prototype. It registers:
+Registers:
 
-* ``OMEZarrFileReader`` - a scripted file reader, so ``slicer.util.loadNodeFromFile``,
-  ``File -> Add Data`` and drag-and-drop can open an OME-Zarr store.
-* ``OMEZarrFileDialog`` - a scripted drop target that recognises dropped OME-Zarr
-  directories (a store is a directory, which the generic "Add Data" dialog would
-  otherwise expand into thousands of chunk files).
-* ``OMEZarrLogic`` - metadata inspection, multiscale level selection, NGFF -> RAS
-  geometry, and region-of-interest (chunk-aligned, partial) reading.
+* ``OMEZarrFileReader`` - scripted file reader (Add Data, drag-and-drop,
+  ``slicer.util.loadNodeFromFile``), for local stores, ``.ozx`` files and URLs.
+* ``OMEZarrFileWriter`` - scripted file writer for scalar and label map volumes.
+* ``OMEZarrFileDialog`` - drop target for OME-Zarr directories.
+* ``OMEZarrLogic`` - level selection, NGFF -> RAS geometry, chunk-limited reads,
+  labels, time series, view-driven refinement.
 
-All NGFF parsing, multiscales handling, store access (local, zip, remote) and
-RFC-4 anatomical orientation come from ``ngff-zarr``; this module only maps the
-result onto MRML volume nodes.
+NGFF parsing, multiscales, store access and RFC-4 orientation come from ngff-zarr.
 """
 
 import json
 import logging
 import os
 import re
+import urllib.request
 
 import numpy as np
 import qt
@@ -55,8 +53,11 @@ LENGTH_UNIT_TO_MM = {
     "yard": 914.4,
 }
 
-DEFAULT_MAX_BYTES = 1 << 30  # 1 GiB per loaded volume (per channel/time point)
-SETTINGS_MAX_BYTES_KEY = "OMEZarr/MaxBytes"
+# Units the display can be switched to (coefficient from mm, suffix).
+DISPLAY_UNITS = {"micrometer": (1000.0, "µm"), "micron": (1000.0, "µm"), "nanometer": (1e6, "nm")}
+
+DEFAULT_BUDGET_FRACTION = 0.25  # of available RAM when the budget setting is "auto"
+FALLBACK_MAX_BYTES = 1 << 30
 
 # Slicer core lookup tables used to colour separate microscopy channels.
 CHANNEL_COLOR_NODE_IDS = {
@@ -69,6 +70,36 @@ CHANNEL_COLOR_NODE_IDS = {
     "grey": "vtkMRMLColorTableNodeGrey",
 }
 
+MAX_COLOR_TABLE_ENTRIES = 65536
+
+
+class Settings:
+    """QSettings keys. Values are read on each use so the module panel takes effect immediately."""
+
+    MAX_BYTES = "OMEZarr/MaxBytes"  # int bytes, 0 = automatic
+    ORIENTATION = "OMEZarr/AssumedOrientation"  # LPS or RAS, used when a store has no RFC-4 orientation
+    LOAD_LABELS = "OMEZarr/LoadLabels"
+    TIME_MODE = "OMEZarr/TimeMode"  # sequence or index
+    DISPLAY_UNITS = "OMEZarr/DisplayUnits"  # switch Slicer's length display unit to the store's
+
+    @staticmethod
+    def get(key, default):
+        value = qt.QSettings().value(key)
+        if value is None or value == "":
+            return default
+        if isinstance(default, bool):
+            return str(value).lower() in ("true", "1", "yes")
+        if isinstance(default, int):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+        return str(value)
+
+    @staticmethod
+    def set(key, value):
+        qt.QSettings().setValue(key, value)
+
 
 #
 # Module
@@ -80,12 +111,13 @@ class OMEZarr(ScriptedLoadableModule):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = _("OME-Zarr")
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Informatics")]
-        self.parent.dependencies = []
+        self.parent.dependencies = ["Sequences"]
         self.parent.contributors = ["Valentin Boussot (Fideus Labs)", "Matt McCormick (Fideus Labs)"]
         self.parent.helpText = _(
-            "Read OME-Zarr (OME-NGFF) images. Drag an .ome.zarr directory into Slicer, or use "
-            "File > Add Data. Multiscale levels are selected automatically to fit a memory budget; "
-            "this module lets you inspect levels and load a region of interest at full resolution."
+            "Read and write OME-Zarr (OME-NGFF) images. Drag an .ome.zarr directory into Slicer, or use "
+            "File > Add Data. The finest resolution level fitting the memory budget is loaded; "
+            "labels and time series are loaded alongside. Use 'Refine current view' to reload what a "
+            "slice view shows at a finer level."
         )
         self.parent.acknowledgementText = _("Built on ngff-zarr (https://github.com/fideus-labs/ngff-zarr).")
 
@@ -99,28 +131,41 @@ def isRemoteUrl(path):
     return bool(re.match(r"^(https?|s3|gs|gcs|az|abfs)://", str(path)))
 
 
-def _multiscalesInAttributes(attrs):
-    if not isinstance(attrs, dict):
-        return False
-    ome = attrs.get("ome", attrs)
-    return isinstance(ome, dict) and "multiscales" in ome
+def joinStorePath(root, *parts):
+    root = str(root).rstrip("/")
+    return "/".join([root, *parts]) if isRemoteUrl(root) else os.path.join(root, *parts)
 
 
-def _hasMultiscalesMetadata(directory):
+def readStoreAttributes(root):
+    """Merged root attributes of a Zarr group (v2 ``.zattrs`` or v3 ``zarr.json``), OME keys unwrapped.
+
+    Returns None when the group has no readable metadata. Local paths and http(s) URLs only.
+    """
+    root = str(root).rstrip("/")
     for name in ("zarr.json", ".zattrs"):
-        metadataFile = os.path.join(directory, name)
-        if not os.path.isfile(metadataFile):
-            continue
+        target = joinStorePath(root, name)
         try:
-            with open(metadataFile, encoding="utf-8") as fp:
-                attrs = json.load(fp)
+            if isRemoteUrl(target):
+                if not target.startswith("http"):
+                    return None
+                with urllib.request.urlopen(target, timeout=20) as response:  # noqa: S310 - user-provided URL
+                    attrs = json.loads(response.read().decode("utf-8"))
+            else:
+                if not os.path.isfile(target):
+                    continue
+                with open(target, encoding="utf-8") as fp:
+                    attrs = json.load(fp)
         except (OSError, ValueError):
+            continue
+        if not isinstance(attrs, dict):
             continue
         if name == "zarr.json":
             attrs = attrs.get("attributes", {})
-        if _multiscalesInAttributes(attrs):
-            return True
-    return False
+        merged = dict(attrs)
+        if isinstance(attrs.get("ome"), dict):
+            merged.update(attrs["ome"])
+        return merged
+    return None
 
 
 def omeZarrRootFromPath(path):
@@ -145,7 +190,55 @@ def omeZarrRootFromPath(path):
             return None
     if not os.path.isdir(path):
         return None
-    return path if _hasMultiscalesMetadata(path) else None
+    attrs = readStoreAttributes(path)
+    return path if attrs and "multiscales" in attrs else None
+
+
+def isLabelStore(root):
+    attrs = readStoreAttributes(root)
+    return bool(attrs and "image-label" in attrs)
+
+
+def labelGroupNames(root):
+    """Names listed in the ``labels`` group of an image store (empty when absent)."""
+    attrs = readStoreAttributes(joinStorePath(root, "labels"))
+    names = attrs.get("labels") if attrs else None
+    return [str(n) for n in names] if isinstance(names, list) else []
+
+
+#
+# Progress reporting
+#
+
+
+class Progress:
+    """Progress dialog with a cancel button when the GUI is up; silent otherwise.
+
+    Used as ``progress(done, total, text)``; returns False once the user cancelled.
+    """
+
+    def __init__(self, label):
+        self.label = label
+        self.dialog = None
+
+    def __enter__(self):
+        if slicer.util.mainWindow() and not slicer.app.testingEnabled():
+            self.dialog = slicer.util.createProgressDialog(labelText=self.label, windowTitle=_("OME-Zarr"), maximum=100)
+        return self
+
+    def __call__(self, done, total, text=None):
+        if self.dialog is None:
+            return True
+        self.dialog.value = int(100 * done / max(1, total))
+        if text:
+            self.dialog.labelText = text
+        slicer.app.processEvents()
+        return not self.dialog.wasCanceled
+
+    def __exit__(self, *args):
+        if self.dialog is not None:
+            self.dialog.close()
+        return False
 
 
 #
@@ -197,11 +290,18 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         dims = list(image.dims)
         return {d: image.data.shape[dims.index(d)] for d in SPATIAL_DIMS if d in dims}
 
+    @staticmethod
+    def axisLength(image, dim):
+        dims = list(image.dims)
+        return int(image.data.shape[dims.index(dim)]) if dim in dims else 1
+
     @classmethod
-    def volumeBytes(cls, image):
-        """Bytes of one spatial volume (single channel, single time point) at this level."""
+    def volumeBytes(cls, image, region=None):
+        """Bytes of one spatial volume (single channel, single time point), or of ``region`` within it."""
         size = 1
-        for n in cls.spatialShape(image).values():
+        for d, n in cls.spatialShape(image).items():
+            if region and d in region:
+                n = region[d][1] - region[d][0]
             size *= int(n)
         return size * int(np.dtype(image.data.dtype).itemsize)
 
@@ -227,20 +327,34 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         return info
 
     @classmethod
-    def selectLevel(cls, multiscales, maxBytes):
-        """Finest level whose single-volume size fits the budget (coarsest level otherwise)."""
+    def selectLevel(cls, multiscales, maxBytes, copies=1):
+        """Finest level whose volume (times ``copies``: channels, time points) fits the budget."""
         for index, image in enumerate(multiscales.images):
-            if cls.volumeBytes(image) <= maxBytes:
+            if cls.volumeBytes(image) * copies <= maxBytes:
                 return index
         return len(multiscales.images) - 1
 
     @staticmethod
     def maxBytesFromSettings():
-        value = qt.QSettings().value(SETTINGS_MAX_BYTES_KEY)
+        """Configured budget, or a fraction of the available RAM when set to automatic."""
+        value = Settings.get(Settings.MAX_BYTES, 0)
+        if value > 0:
+            return value
         try:
-            return int(value) if value is not None else DEFAULT_MAX_BYTES
-        except (TypeError, ValueError):
-            return DEFAULT_MAX_BYTES
+            import psutil
+
+            return int(psutil.virtual_memory().available * DEFAULT_BUDGET_FRACTION)
+        except Exception:  # noqa: BLE001 - psutil is optional
+            return FALLBACK_MAX_BYTES
+
+    @staticmethod
+    def timeUnit(image):
+        return str((image.axes_units or {}).get("t") or "")
+
+    @staticmethod
+    def lengthUnit(image):
+        units = image.axes_units or {}
+        return next((str(units[d]) for d in SPATIAL_DIMS if units.get(d)), "")
 
     # ---- geometry ----
 
@@ -262,11 +376,10 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def axesOrientations(image, metadata=None):
-        """RFC-4 orientation per spatial axis as AnatomicalOrientation objects.
+        """RFC-4 orientation per spatial axis.
 
-        ``NgffImage.axes_orientations`` is used when set. Otherwise the parsed
-        multiscales metadata axes are consulted (ngff-zarr's reader currently
-        leaves ``axes_orientations`` unset on read, see the README).
+        ``NgffImage.axes_orientations`` when set (ngff-zarr >= PR #741), otherwise the
+        raw axis metadata of the multiscales entry.
         """
         from ngff_zarr.rfc4 import AnatomicalOrientation, AnatomicalOrientationValues
 
@@ -289,44 +402,78 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @classmethod
     def ijkToRasMatrix(cls, image, userMessages=None, metadata=None):
-        """4x4 IJK->RAS (mm) for an NgffImage.
+        """4x4 IJK->RAS (mm) and the orientation source ("rfc4", "assumed-LPS", "assumed-RAS").
 
-        Convention (shared with ngff-zarr's ITK conversion): NGFF x/y/z are ITK/LPS
-        physical axes, ``translation`` is the origin, and the RFC-4 anatomical
-        orientation of each axis (when present for all spatial axes) gives the
-        direction cosines. Missing z axis (2D) gets unit spacing.
+        NGFF x/y/z are ITK/LPS physical axes (the ngff-zarr convention) and ``translation``
+        is the origin. RFC-4 orientation of every spatial axis gives the direction cosines.
+        Without it, the axes are assumed LPS or RAS per the module setting.
         """
         from ngff_zarr.rfc4 import anatomical_orientation_to_itk_direction
 
         dims = list(image.dims)
         factors = cls.unitScaleToMm(image, userMessages)
-        direction = np.eye(3)
-        orientations = cls.axesOrientations(image, metadata)
         spatialDims = [d for d in SPATIAL_DIMS if d in dims]
+        orientations = cls.axesOrientations(image, metadata)
+        columns = {}
         if spatialDims and all(d in orientations for d in spatialDims):
-            columns = {}
             for d in spatialDims:
                 column = anatomical_orientation_to_itk_direction(orientations[d].value)
                 if column is None:
-                    columns = None
+                    columns = {}
                     break
                 columns[d] = column
-            if columns:
-                for columnIndex, d in enumerate(SPATIAL_DIMS):
-                    if d in columns:
-                        direction[:, columnIndex] = columns[d]
         spacing = [image.scale.get(d, 1.0) * factors[d] if d in dims else 1.0 for d in SPATIAL_DIMS]
         origin = [image.translation.get(d, 0.0) * factors[d] if d in dims else 0.0 for d in SPATIAL_DIMS]
-        ijkToLps = np.eye(4)
-        ijkToLps[:3, :3] = direction @ np.diag(spacing)
-        ijkToLps[:3, 3] = origin
-        lpsToRas = np.diag([-1.0, -1.0, 1.0, 1.0])
-        return lpsToRas @ ijkToLps
+        direction = np.eye(3)
+        if columns:
+            source = "rfc4"
+            for columnIndex, d in enumerate(SPATIAL_DIMS):
+                if d in columns:
+                    direction[:, columnIndex] = columns[d]
+            toRas = np.diag([-1.0, -1.0, 1.0, 1.0])
+        else:
+            assumed = Settings.get(Settings.ORIENTATION, "LPS").upper()
+            source = f"assumed-{assumed}"
+            toRas = np.eye(4) if assumed == "RAS" else np.diag([-1.0, -1.0, 1.0, 1.0])
+            if userMessages:
+                userMessages.AddMessage(
+                    vtk.vtkCommand.MessageEvent,
+                    f"No anatomical orientation (RFC-4) in the store; x/y/z axes assumed {assumed} "
+                    "(OME-Zarr module settings).",
+                )
+        ijkToPhysical = np.eye(4)
+        ijkToPhysical[:3, :3] = direction @ np.diag(spacing)
+        ijkToPhysical[:3, 3] = origin
+        return toRas @ ijkToPhysical, source
 
     # ---- array access ----
 
     @staticmethod
-    def spatialArray(image, timeIndex=0, channelIndex=0, region=None, userMessages=None):
+    def computeArray(darray, progress=None, label=""):
+        """Compute a dask array slab by slab along its first axis, reporting progress.
+
+        Slabs are groups of chunks of about 64 MiB, at most 32 of them, so small volumes
+        are one parallel compute and large ones report progress. Raises InterruptedError
+        when cancelled.
+        """
+        if not hasattr(darray, "compute"):
+            return np.asarray(darray)
+        chunks = list(darray.chunks[0])
+        steps = max(1, min(32, int(np.ceil(darray.nbytes / (64 << 20)))))
+        groupSize = max(1, int(np.ceil(len(chunks) / steps)))
+        output = np.empty(darray.shape, dtype=darray.dtype)
+        start = 0
+        total = int(np.ceil(len(chunks) / groupSize))
+        for step in range(total):
+            size = sum(chunks[step * groupSize : (step + 1) * groupSize])
+            output[start : start + size] = darray[start : start + size].compute()
+            start += size
+            if progress and not progress(step + 1, total, label):
+                raise InterruptedError("Loading cancelled")
+        return output
+
+    @classmethod
+    def spatialArray(cls, image, timeIndex=0, channelIndex=0, region=None, userMessages=None, progress=None, label=""):
         """Read one (z, y, x) volume as numpy. Only chunks intersecting ``region`` are read.
 
         ``region`` maps spatial dim -> (start, stop) in this level's index space.
@@ -352,10 +499,10 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             raise ValueError("OME-Zarr image must have x and y axes")
         order = [remaining.index(d) for d in ("z", "y", "x") if d in remaining]
         sub = sub.transpose(order)
-        array = np.asarray(sub.compute() if hasattr(sub, "compute") else sub)
+        array = cls.computeArray(sub, progress, label)
         if "z" not in remaining:
             array = array[np.newaxis, ...]
-        return OMEZarrLogic.toVtkCompatibleDtype(array)
+        return cls.toVtkCompatibleDtype(array)
 
     @staticmethod
     def toVtkCompatibleDtype(array):
@@ -365,7 +512,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             return array.astype(np.float32)
         return array
 
-    # ---- node creation ----
+    # ---- channels and display ----
 
     @staticmethod
     def channelDescriptions(multiscales, image):
@@ -411,83 +558,6 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             }.get(frozenset(high))
         )
 
-    @classmethod
-    def loadImage(
-        cls,
-        path,
-        level=None,
-        timeIndex=0,
-        channels=None,
-        region=None,
-        name=None,
-        maxBytes=None,
-        userMessages=None,
-        multiscales=None,
-    ):
-        """Create one scalar volume node per requested channel. Returns the nodes.
-
-        ``region``: spatial dim -> (start, stop) at the chosen level (partial read).
-        """
-        multiscales = multiscales or cls.openMultiscales(path)
-        if level is None:
-            level = cls.selectLevel(multiscales, maxBytes or cls.maxBytesFromSettings())
-        level = int(level)
-        if level < 0 or level >= len(multiscales.images):
-            raise ValueError(f"Level {level} out of range (0..{len(multiscales.images) - 1})")
-        image = multiscales.images[level]
-        dims = list(image.dims)
-
-        if level > 0 and region is None and userMessages:
-            full = cls.volumeBytes(multiscales.images[0])
-            factor = cls.levelInfo(multiscales)[level]["downsample"]
-            userMessages.AddMessage(
-                vtk.vtkCommand.WarningEvent,
-                f"Loaded multiscale level {level} (downsampled by "
-                f"{', '.join(f'{d}: {v:g}' for d, v in factor.items())}) because level 0 "
-                f"would need {full / 2**30:.2f} GiB. Use the OME-Zarr module to load a "
-                "region of interest at full resolution or change the memory budget.",
-            )
-        if "t" in dims and image.data.shape[dims.index("t")] > 1 and userMessages:
-            userMessages.AddMessage(
-                vtk.vtkCommand.WarningEvent,
-                f"Time axis has {image.data.shape[dims.index('t')]} points; loaded index {timeIndex}.",
-            )
-
-        ijkToRas = cls.ijkToRasMatrix(image, userMessages, multiscales.metadata)
-        if region:
-            start = np.array([region.get(d, (0, None))[0] for d in SPATIAL_DIMS], dtype=float)
-            ijkToRas = ijkToRas.copy()
-            ijkToRas[:3, 3] = (ijkToRas @ np.append(start, 1.0))[:3]
-
-        descriptions = cls.channelDescriptions(multiscales, image)
-        if channels is None:
-            channels = list(range(len(descriptions)))
-        baseName = name or cls.defaultNodeName(path)
-        units = image.axes_units or {}
-        lengthUnit = next((str(units[d]) for d in SPATIAL_DIMS if units.get(d)), "")
-
-        nodes = []
-        for channelIndex in channels:
-            array = cls.spatialArray(image, timeIndex, channelIndex, region, userMessages)
-            label = descriptions[channelIndex]["label"] or (f"c{channelIndex}" if len(descriptions) > 1 else None)
-            nodeName = f"{baseName}_{label}" if label else baseName
-            if region:
-                nodeName += "_ROI"
-            node = slicer.util.addVolumeFromArray(
-                array, ijkToRAS=ijkToRas, name=slicer.mrmlScene.GenerateUniqueName(nodeName)
-            )
-            node.SetAttribute("OMEZarr.Path", str(path))
-            node.SetAttribute("OMEZarr.Level", str(level))
-            node.SetAttribute("OMEZarr.Dims", ",".join(dims))
-            node.SetAttribute("OMEZarr.TimeIndex", str(timeIndex))
-            node.SetAttribute("OMEZarr.Channel", str(channelIndex))
-            node.SetAttribute("OMEZarr.LengthUnit", lengthUnit)
-            if region:
-                node.SetAttribute("OMEZarr.Region", ";".join(f"{d}:{s}-{e}" for d, (s, e) in region.items()))
-            cls.setupDisplay(node, descriptions[channelIndex], multiChannel=len(descriptions) > 1)
-            nodes.append(node)
-        return nodes
-
     @staticmethod
     def setupDisplay(node, description, multiChannel):
         node.CreateDefaultDisplayNodes()
@@ -511,12 +581,274 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 return base[: -len(suffix)]
         return base or "OMEZarr"
 
+    @staticmethod
+    def setNodeAttributes(node, path, level, dims, timeIndex, channelIndex, lengthUnit, orientationSource, region):
+        node.SetAttribute("OMEZarr.Path", str(path))
+        node.SetAttribute("OMEZarr.Level", str(level))
+        node.SetAttribute("OMEZarr.Dims", ",".join(dims))
+        node.SetAttribute("OMEZarr.TimeIndex", str(timeIndex))
+        node.SetAttribute("OMEZarr.Channel", str(channelIndex))
+        node.SetAttribute("OMEZarr.LengthUnit", lengthUnit)
+        node.SetAttribute("OMEZarr.OrientationSource", orientationSource)
+        if region:
+            node.SetAttribute("OMEZarr.Region", ";".join(f"{d}:{s}-{e}" for d, (s, e) in region.items()))
+
+    # ---- loading ----
+
+    @classmethod
+    def loadImage(
+        cls,
+        path,
+        level=None,
+        timeIndex=None,
+        channels=None,
+        region=None,
+        name=None,
+        maxBytes=None,
+        userMessages=None,
+        multiscales=None,
+        labels=None,
+        timeMode=None,
+        progress=None,
+    ):
+        """Load a store into volume nodes. Returns the created nodes (volumes, proxies, label maps).
+
+        ``region``: spatial dim -> (start, stop) at the chosen level (partial read).
+        ``timeIndex``: a single time point; otherwise the setting decides between a
+        Sequence of all time points and index 0. ``labels``: also load the ``labels`` groups.
+        """
+        multiscales = multiscales or cls.openMultiscales(path)
+        if isLabelStore(path):
+            return cls.loadLabelStore(path, level, region, name, userMessages, multiscales, progress=progress)
+        baseImage = multiscales.images[0]
+        descriptions = cls.channelDescriptions(multiscales, baseImage)
+        channels = list(range(len(descriptions))) if channels is None else list(channels)
+        timePoints = cls.axisLength(baseImage, "t")
+        if timeIndex is None:
+            timeMode = timeMode or Settings.get(Settings.TIME_MODE, "sequence")
+            asSequence = timePoints > 1 and timeMode == "sequence"
+            timeIndex = 0
+        else:
+            asSequence = False
+            timeIndex = int(timeIndex)
+        copies = len(channels) * (timePoints if asSequence else 1)
+        if level is None:
+            level = cls.selectLevel(multiscales, maxBytes or cls.maxBytesFromSettings(), copies)
+        level = int(level)
+        if level < 0 or level >= len(multiscales.images):
+            raise ValueError(f"Level {level} out of range (0..{len(multiscales.images) - 1})")
+        image = multiscales.images[level]
+        dims = list(image.dims)
+
+        if level > 0 and region is None and userMessages:
+            full = cls.volumeBytes(multiscales.images[0]) * copies
+            factor = cls.levelInfo(multiscales)[level]["downsample"]
+            userMessages.AddMessage(
+                vtk.vtkCommand.WarningEvent,
+                f"Loaded multiscale level {level} (downsampled by "
+                f"{', '.join(f'{d}: {v:g}' for d, v in factor.items())}) because level 0 "
+                f"would need {full / 2**30:.2f} GiB. Use 'Refine current view' or a region of "
+                "interest in the OME-Zarr module for full resolution, or raise the memory budget.",
+            )
+        if timePoints > 1 and not asSequence and userMessages:
+            userMessages.AddMessage(
+                vtk.vtkCommand.MessageEvent, f"Time axis has {timePoints} points; loaded index {timeIndex}."
+            )
+
+        ijkToRas, orientationSource = cls.ijkToRasMatrix(image, userMessages, multiscales.metadata)
+        if region:
+            start = np.array([region.get(d, (0, None))[0] for d in SPATIAL_DIMS], dtype=float)
+            ijkToRas = ijkToRas.copy()
+            ijkToRas[:3, 3] = (ijkToRas @ np.append(start, 1.0))[:3]
+
+        baseName = name or cls.defaultNodeName(path)
+        lengthUnit = cls.lengthUnit(image)
+        nodes = []
+        sequences = []
+        for channelIndex in channels:
+            label = descriptions[channelIndex]["label"] or (f"c{channelIndex}" if len(descriptions) > 1 else None)
+            nodeName = f"{baseName}_{label}" if label else baseName
+            if region:
+                nodeName += "_ROI"
+            nodeName = slicer.mrmlScene.GenerateUniqueName(nodeName)
+            if asSequence:
+                sequence = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", nodeName + "_sequence")
+                sequence.SetIndexName("time")
+                sequence.SetIndexUnit(cls.timeUnit(image))
+                timeScale = float(image.scale.get("t", 1.0))
+                for t in range(timePoints):
+                    array = cls.spatialArray(
+                        image, t, channelIndex, region, userMessages, progress, f"{nodeName}, t={t + 1}/{timePoints}"
+                    )
+                    dataNode = slicer.vtkMRMLScalarVolumeNode()
+                    dataNode.SetName(nodeName)
+                    slicer.util.updateVolumeFromArray(dataNode, array)
+                    dataNode.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
+                    cls.setNodeAttributes(
+                        dataNode, path, level, dims, t, channelIndex, lengthUnit, orientationSource, region
+                    )
+                    sequence.SetDataNodeAtValue(dataNode, f"{t * timeScale:g}")
+                cls.setNodeAttributes(
+                    sequence, path, level, dims, -1, channelIndex, lengthUnit, orientationSource, region
+                )
+                sequences.append((sequence, descriptions[channelIndex]))
+            else:
+                array = cls.spatialArray(image, timeIndex, channelIndex, region, userMessages, progress, nodeName)
+                node = slicer.util.addVolumeFromArray(array, ijkToRAS=ijkToRas, name=nodeName)
+                cls.setNodeAttributes(
+                    node, path, level, dims, timeIndex, channelIndex, lengthUnit, orientationSource, region
+                )
+                cls.setupDisplay(node, descriptions[channelIndex], multiChannel=len(descriptions) > 1)
+                nodes.append(node)
+
+        if sequences:
+            browser = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceBrowserNode", baseName + "_browser")
+            for index, (sequence, _description) in enumerate(sequences):
+                if index == 0:
+                    browser.SetAndObserveMasterSequenceNodeID(sequence.GetID())
+                else:
+                    browser.AddSynchronizedSequenceNodeID(sequence.GetID())
+            slicer.modules.sequences.logic().UpdateProxyNodesFromSequences(browser)
+            for sequence, description in sequences:
+                proxy = browser.GetProxyNode(sequence)
+                if proxy is not None:
+                    cls.setupDisplay(proxy, description, multiChannel=len(descriptions) > 1)
+                    nodes.append(proxy)
+
+        if labels is None:
+            labels = Settings.get(Settings.LOAD_LABELS, True)
+        if labels:
+            regionBounds = cls.rasBoundsOfRegion(image, region, ijkToRas) if region else None
+            nodes += cls.loadLabelGroups(path, image, level, baseName, regionBounds, userMessages, progress)
+
+        cls.applyDisplayUnits(lengthUnit)
+        return nodes
+
+    @staticmethod
+    def rasBoundsOfRegion(image, region, ijkToRas):
+        """RAS bounds of a region whose ``ijkToRas`` already has the region origin."""
+        size = [region[d][1] - region[d][0] if d in region else OMEZarrLogic.axisLength(image, d) for d in SPATIAL_DIMS]
+        corners = np.array(
+            [[i, j, k, 1.0] for i in (0, size[0] - 1) for j in (0, size[1] - 1) for k in (0, size[2] - 1)]
+        )
+        ras = (ijkToRas @ corners.T).T[:, :3]
+        return [ras[:, 0].min(), ras[:, 0].max(), ras[:, 1].min(), ras[:, 1].max(), ras[:, 2].min(), ras[:, 2].max()]
+
+    # ---- labels ----
+
+    @classmethod
+    def matchingLevel(cls, multiscales, referenceImage):
+        """Level of ``multiscales`` whose spacing is closest to ``referenceImage``'s."""
+        reference = np.array([referenceImage.scale.get(d, 1.0) for d in SPATIAL_DIMS if d in referenceImage.dims])
+        best, bestDistance = 0, None
+        for index, image in enumerate(multiscales.images):
+            scale = np.array([image.scale.get(d, 1.0) for d in SPATIAL_DIMS if d in referenceImage.dims])
+            distance = (
+                float(np.abs(np.log(scale / reference)).sum()) if scale.shape == reference.shape else float("inf")
+            )
+            if bestDistance is None or distance < bestDistance:
+                best, bestDistance = index, distance
+        return best
+
+    @classmethod
+    def loadLabelGroups(cls, root, image, level, baseName, rasBounds=None, userMessages=None, progress=None):
+        nodes = []
+        for labelName in labelGroupNames(root):
+            labelPath = joinStorePath(root, "labels", labelName)
+            try:
+                labelMultiscales = cls.openMultiscales(labelPath)
+                labelLevel = cls.matchingLevel(labelMultiscales, image)
+                region = None
+                if rasBounds is not None:
+                    region = cls.regionFromRasBounds(
+                        labelMultiscales.images[labelLevel], rasBounds, labelMultiscales.metadata
+                    )
+                nodes += cls.loadLabelStore(
+                    labelPath, labelLevel, region, f"{baseName}_{labelName}", userMessages, labelMultiscales, progress
+                )
+            except Exception as e:  # noqa: BLE001 - a broken label group must not block the image
+                message = f"Could not load labels '{labelName}': {e}"
+                logging.exception(message)
+                if userMessages:
+                    userMessages.AddMessage(vtk.vtkCommand.WarningEvent, message)
+        return nodes
+
+    @classmethod
+    def loadLabelStore(
+        cls, path, level=None, region=None, name=None, userMessages=None, multiscales=None, progress=None
+    ):
+        """Load an ``image-label`` multiscales into a label map volume with its colour table."""
+        multiscales = multiscales or cls.openMultiscales(path)
+        if level is None:
+            level = cls.selectLevel(multiscales, cls.maxBytesFromSettings())
+        image = multiscales.images[int(level)]
+        dims = list(image.dims)
+        ijkToRas, orientationSource = cls.ijkToRasMatrix(image, userMessages, multiscales.metadata)
+        if region:
+            start = np.array([region.get(d, (0, None))[0] for d in SPATIAL_DIMS], dtype=float)
+            ijkToRas = ijkToRas.copy()
+            ijkToRas[:3, 3] = (ijkToRas @ np.append(start, 1.0))[:3]
+        nodeName = slicer.mrmlScene.GenerateUniqueName((name or cls.defaultNodeName(path)) + ("_ROI" if region else ""))
+        array = cls.spatialArray(image, 0, 0, region, userMessages, progress, nodeName)
+        if not np.issubdtype(array.dtype, np.integer):
+            array = array.astype(np.int32)
+        node = slicer.util.addVolumeFromArray(
+            array, ijkToRAS=ijkToRas, name=nodeName, nodeClassName="vtkMRMLLabelMapVolumeNode"
+        )
+        cls.setNodeAttributes(node, path, int(level), dims, 0, 0, cls.lengthUnit(image), orientationSource, region)
+        node.CreateDefaultDisplayNodes()
+        attrs = (multiscales.root_attributes or {}).get("image-label") if multiscales.root_attributes else None
+        if attrs is None:
+            attrs = (readStoreAttributes(path) or {}).get("image-label")
+        colorNode = cls.colorTableFromImageLabel(attrs, nodeName + "_colors")
+        if colorNode is not None:
+            node.GetDisplayNode().SetAndObserveColorNodeID(colorNode.GetID())
+        cls.applyDisplayUnits(cls.lengthUnit(image))
+        return [node]
+
+    @staticmethod
+    def colorTableFromImageLabel(imageLabel, name):
+        """Colour table node from ``image-label`` colours and properties, or None."""
+        if not isinstance(imageLabel, dict):
+            return None
+        colors = {}
+        for entry in imageLabel.get("colors") or []:
+            try:
+                value = int(entry["label-value"])
+                rgba = [float(v) for v in entry.get("rgba", [0, 0, 0, 255])]
+            except (KeyError, TypeError, ValueError):
+                continue
+            colors.setdefault(value, {})["rgba"] = rgba
+        for entry in imageLabel.get("properties") or []:
+            try:
+                value = int(entry["label-value"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            label = entry.get("name") or entry.get("label") or entry.get("acronym")
+            if label:
+                colors.setdefault(value, {})["name"] = str(label)
+        if not colors:
+            return None
+        maxValue = max(colors)
+        if maxValue >= MAX_COLOR_TABLE_ENTRIES or min(colors) < 0:
+            logging.warning(f"Label values up to {maxValue} are too many for a colour table; default colours are used.")
+            return None
+        colorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLColorTableNode", name)
+        colorNode.SetTypeToUser()
+        colorNode.SetHideFromEditors(False)
+        colorNode.SetNumberOfColors(maxValue + 1)
+        colorNode.SetColor(0, "background", 0.0, 0.0, 0.0, 0.0)
+        for value, info in colors.items():
+            r, g, b, a = (info.get("rgba") or [128.0, 128.0, 128.0, 255.0])[:4]
+            colorNode.SetColor(value, info.get("name", str(value)), r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+        return colorNode
+
     # ---- region of interest ----
 
     @classmethod
     def regionFromRasBounds(cls, image, rasBounds, metadata=None):
         """Map RAS bounds [xmin,xmax,ymin,ymax,zmin,zmax] to index ranges at this level."""
-        ijkToRas = cls.ijkToRasMatrix(image, metadata=metadata)
+        ijkToRas, _source = cls.ijkToRasMatrix(image, metadata=metadata)
         rasToIjk = np.linalg.inv(ijkToRas)
         corners = np.array(
             [[rasBounds[i], rasBounds[2 + j], rasBounds[4 + k], 1.0] for i in (0, 1) for j in (0, 1) for k in (0, 1)]
@@ -535,7 +867,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         return region
 
     @classmethod
-    def loadRegion(cls, path, roiNode, level=0, timeIndex=0, channels=None, name=None, userMessages=None):
+    def loadRegion(
+        cls, path, roiNode, level=0, timeIndex=None, channels=None, name=None, userMessages=None, progress=None
+    ):
         multiscales = cls.openMultiscales(path)
         bounds = [0.0] * 6
         roiNode.GetRASBounds(bounds)
@@ -549,17 +883,115 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             name=name,
             userMessages=userMessages,
             multiscales=multiscales,
+            progress=progress,
         )
 
-    # ---- write side (used by tests; candidate for an ngff-zarr helper) ----
+    # ---- view-driven refinement ----
+
+    @staticmethod
+    def sliceViewRasBounds(sliceViewName):
+        """RAS bounds of the block a slice view shows: its field of view, extended along the
+        normal by half the smaller side."""
+        sliceWidget = slicer.app.layoutManager().sliceWidget(sliceViewName)
+        if sliceWidget is None:
+            raise ValueError(f"No slice view named '{sliceViewName}'")
+        sliceNode = sliceWidget.mrmlSliceNode()
+        sliceToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetSliceToRAS())
+        width, height, _depth = sliceNode.GetFieldOfView()
+        thickness = min(width, height) / 2.0
+        corners = np.array(
+            [
+                [x, y, z, 1.0]
+                for x in (-width / 2, width / 2)
+                for y in (-height / 2, height / 2)
+                for z in (-thickness / 2, thickness / 2)
+            ]
+        )
+        ras = (sliceToRas @ corners.T).T[:, :3]
+        return [ras[:, 0].min(), ras[:, 0].max(), ras[:, 1].min(), ras[:, 1].max(), ras[:, 2].min(), ras[:, 2].max()]
+
+    @classmethod
+    def refineView(cls, path, sliceViewName="Red", maxBytes=None, timeIndex=None, userMessages=None, progress=None):
+        """Reload what ``sliceViewName`` shows at the finest level whose block fits the budget.
+
+        Previous refined nodes of the same store are replaced. The first channel is shown as
+        foreground of the slice views, labels in the label layer. Returns the new nodes.
+        """
+        multiscales = cls.openMultiscales(path)
+        bounds = cls.sliceViewRasBounds(sliceViewName)
+        budget = maxBytes or cls.maxBytesFromSettings()
+        channels = len(cls.channelDescriptions(multiscales, multiscales.images[0]))
+        chosen = None
+        for level, image in enumerate(multiscales.images):
+            try:
+                region = cls.regionFromRasBounds(image, bounds, multiscales.metadata)
+            except ValueError:
+                continue
+            if cls.volumeBytes(image, region) * channels <= budget:
+                chosen = (level, region)
+                break
+        if chosen is None:
+            raise ValueError("The view does not intersect the image, or no level fits the memory budget")
+        level, region = chosen
+        for node in list(slicer.util.getNodesByClass("vtkMRMLVolumeNode")):
+            if node.GetAttribute("OMEZarr.Refined") == "1" and node.GetAttribute("OMEZarr.Path") == str(path):
+                slicer.mrmlScene.RemoveNode(node)
+        nodes = cls.loadImage(
+            path,
+            level=level,
+            timeIndex=0 if timeIndex is None else timeIndex,
+            region=region,
+            name=cls.defaultNodeName(path) + "_refined",
+            userMessages=userMessages,
+            multiscales=multiscales,
+            progress=progress,
+        )
+        for node in nodes:
+            node.SetAttribute("OMEZarr.Refined", "1")
+        scalars = [n for n in nodes if not n.IsA("vtkMRMLLabelMapVolumeNode")]
+        labels = [n for n in nodes if n.IsA("vtkMRMLLabelMapVolumeNode")]
+        slicer.util.setSliceViewerLayers(
+            foreground=scalars[0] if scalars else "keep-current",
+            foregroundOpacity=1.0 if scalars else None,
+            label=labels[0] if labels else "keep-current",
+        )
+        return nodes
+
+    # ---- display units ----
+
+    @staticmethod
+    def applyDisplayUnits(lengthUnit):
+        """Switch Slicer's length display to the store's unit when the setting is on."""
+        if not Settings.get(Settings.DISPLAY_UNITS, False) or lengthUnit not in DISPLAY_UNITS:
+            return
+        coefficient, suffix = DISPLAY_UNITS[lengthUnit]
+        unitNode = slicer.mrmlScene.GetNodeByID("vtkMRMLUnitNodeApplicationLength")
+        if unitNode is None:
+            return
+        unitNode.SetDisplayCoefficient(coefficient)
+        unitNode.SetSuffix(suffix)
+        unitNode.SetPrecision(2)
+
+    @staticmethod
+    def resetDisplayUnits():
+        unitNode = slicer.mrmlScene.GetNodeByID("vtkMRMLUnitNodeApplicationLength")
+        if unitNode is None:
+            return
+        unitNode.SetDisplayCoefficient(1.0)
+        unitNode.SetSuffix("mm")
+        unitNode.SetPrecision(3)
+
+    # ---- write side ----
 
     @staticmethod
     def ngffImageFromVolumeNode(volumeNode, name=None):
-        """NgffImage (z,y,x, millimeter, RFC-4 orientation) from a scalar volume node."""
+        """NgffImage (z,y,x, millimeter, RFC-4 orientation) from a scalar or label map volume node."""
         import ngff_zarr
         from ngff_zarr.rfc4 import itk_direction_to_anatomical_orientation
 
         array = slicer.util.arrayFromVolume(volumeNode)
+        if array.ndim != 3:
+            raise ValueError("Only single-component volumes can be written as OME-Zarr")
         ijkToRasVtk = vtk.vtkMatrix4x4()
         volumeNode.GetIJKToRASMatrix(ijkToRasVtk)
         ijkToRas = slicer.util.arrayFromVTKMatrix(ijkToRasVtk)
@@ -571,7 +1003,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             d: itk_direction_to_anatomical_orientation(list(direction[:, i])) for i, d in enumerate(SPATIAL_DIMS)
         }
         image = ngff_zarr.to_ngff_image(
-            array,
+            np.ascontiguousarray(array),
             dims=("z", "y", "x"),
             scale={d: float(spacing[i]) for i, d in enumerate(SPATIAL_DIMS)},
             translation={d: float(origin[i]) for i, d in enumerate(SPATIAL_DIMS)},
@@ -580,6 +1012,99 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         )
         image.axes_orientations = orientations
         return image
+
+    @staticmethod
+    def imageLabelFromNode(labelNode, version):
+        """``image-label`` metadata for a label map volume, from its colour table."""
+        values = np.unique(slicer.util.arrayFromVolume(labelNode))
+        values = [int(v) for v in values if v != 0]
+        colors, properties = [], []
+        display = labelNode.GetDisplayNode()
+        colorNode = display.GetColorNode() if display else None
+        for value in values:
+            rgba = [0.5, 0.5, 0.5, 1.0]
+            name = str(value)
+            if colorNode is not None and value < colorNode.GetNumberOfColors():
+                colorNode.GetColor(value, rgba)
+                name = colorNode.GetColorName(value) or name
+            colors.append({"label-value": value, "rgba": [int(round(c * 255)) for c in rgba]})
+            properties.append({"label-value": value, "name": name})
+        return {"version": version, "colors": colors, "properties": properties}
+
+    @classmethod
+    def writeVolume(cls, node, storePath, progress=None):
+        """Write a scalar or label map volume as an OME-Zarr multiscales store."""
+        ngff_zarr = cls.ensureNgffZarr()
+        from ngff_zarr import Methods
+
+        isLabel = node.IsA("vtkMRMLLabelMapVolumeNode")
+        image = cls.ngffImageFromVolumeNode(node)
+        method = Methods.ITKWASM_LABEL_IMAGE if isLabel else None
+        try:
+            multiscales = ngff_zarr.to_multiscales(image, method=method)
+        except Exception:  # noqa: BLE001 - fall back to a single level rather than fail
+            logging.exception("Multiscale generation failed; writing a single level")
+            multiscales = ngff_zarr.to_multiscales(image, scale_factors=[])
+        if progress:
+            progress(0, 1, f"Writing {os.path.basename(storePath)}")
+        ngff_zarr.to_ome_zarr(storePath, multiscales, overwrite=True)
+        version = str(getattr(multiscales.metadata, "version", "0.5") or "0.5")
+        if isLabel:
+            cls.addImageLabelMetadata(storePath, cls.imageLabelFromNode(node, version))
+            cls.registerLabelInParent(storePath)
+        cls.clearCache()
+        if progress:
+            progress(1, 1)
+        return storePath
+
+    @staticmethod
+    def _updateGroupMetadata(groupPath, update):
+        """Apply ``update(omeAttrs)`` to the OME attributes of a local Zarr group (v2 or v3)."""
+        v3 = os.path.join(groupPath, "zarr.json")
+        v2 = os.path.join(groupPath, ".zattrs")
+        if os.path.isfile(v3):
+            with open(v3, encoding="utf-8") as fp:
+                document = json.load(fp)
+            attributes = document.setdefault("attributes", {})
+            ome = attributes.setdefault("ome", {})
+            update(ome)
+            with open(v3, "w", encoding="utf-8") as fp:
+                json.dump(document, fp, indent=2)
+        else:
+            document = {}
+            if os.path.isfile(v2):
+                with open(v2, encoding="utf-8") as fp:
+                    document = json.load(fp)
+            update(document)
+            with open(v2, "w", encoding="utf-8") as fp:
+                json.dump(document, fp, indent=2)
+
+    @classmethod
+    def addImageLabelMetadata(cls, storePath, imageLabel):
+        cls._updateGroupMetadata(storePath, lambda ome: ome.__setitem__("image-label", imageLabel))
+
+    @classmethod
+    def registerLabelInParent(cls, storePath):
+        """When written into ``<image>/labels/<name>``, list the name in the ``labels`` group."""
+        labelsDir = os.path.dirname(os.path.abspath(storePath))
+        imageRoot = os.path.dirname(labelsDir)
+        if os.path.basename(labelsDir) != "labels" or not omeZarrRootFromPath(imageRoot):
+            return
+        name = os.path.basename(storePath)
+        zarrV3 = os.path.isfile(os.path.join(imageRoot, "zarr.json"))
+        version = (readStoreAttributes(imageRoot) or {}).get("version", "0.4")
+        if zarrV3 and not os.path.isfile(os.path.join(labelsDir, "zarr.json")):
+            with open(os.path.join(labelsDir, "zarr.json"), "w", encoding="utf-8") as fp:
+                json.dump({"zarr_format": 3, "node_type": "group", "attributes": {"ome": {"version": version}}}, fp)
+        elif not zarrV3 and not os.path.isfile(os.path.join(labelsDir, ".zgroup")):
+            with open(os.path.join(labelsDir, ".zgroup"), "w", encoding="utf-8") as fp:
+                json.dump({"zarr_format": 2}, fp)
+
+        def update(ome):
+            names = [n for n in ome.get("labels", []) if n != name]
+            ome["labels"] = [*names, name]
+
+        cls._updateGroupMetadata(labelsDir, update)
 
 
 #
@@ -617,17 +1142,26 @@ class OMEZarrFileReader:
             root = omeZarrRootFromPath(properties["fileName"])
             if not root:
                 raise ValueError(f"Not an OME-Zarr multiscales store: {properties['fileName']}")
-            level = properties.get("level")
-            maxBytes = properties.get("maxBytes")
-            with slicer.util.MessageDialog(_("Loading OME-Zarr...")) if slicer.util.mainWindow() else _NoContext():
+
+            def optional(key, cast):
+                value = properties.get(key)
+                return cast(value) if value not in (None, "") else None
+
+            with Progress(_("Loading OME-Zarr...")) as progress:
                 nodes = OMEZarrLogic.loadImage(
                     root,
-                    level=int(level) if level not in (None, "") else None,
-                    timeIndex=int(properties.get("timeIndex", 0)),
+                    level=optional("level", int),
+                    timeIndex=optional("timeIndex", int),
                     name=properties.get("name"),
-                    maxBytes=int(maxBytes) if maxBytes else None,
+                    maxBytes=optional("maxBytes", int),
+                    labels=optional("labels", lambda v: str(v).lower() in ("true", "1")),
+                    timeMode=optional("timeMode", str),
                     userMessages=self.parent.userMessages(),
+                    progress=progress,
                 )
+        except InterruptedError:
+            self.parent.userMessages().AddMessage(vtk.vtkCommand.WarningEvent, "Loading cancelled")
+            return False
         except Exception as e:  # noqa: BLE001 - report everything to the user
             import traceback
 
@@ -636,17 +1170,55 @@ class OMEZarrFileReader:
             return False
 
         if properties.get("show", True) and nodes:
-            slicer.util.setSliceViewerLayers(background=nodes[0], fit=True)
+            scalars = [n for n in nodes if not n.IsA("vtkMRMLLabelMapVolumeNode")]
+            labels = [n for n in nodes if n.IsA("vtkMRMLLabelMapVolumeNode")]
+            slicer.util.setSliceViewerLayers(
+                background=scalars[0] if scalars else "keep-current",
+                label=labels[0] if labels else "keep-current",
+                fit=True,
+            )
         self.parent.loadedNodes = [node.GetID() for node in nodes]
         return True
 
 
-class _NoContext:
-    def __enter__(self):
-        return self
+#
+# File writer (File > Save, slicer.util.saveNode)
+#
 
-    def __exit__(self, *args):
-        return False
+
+class OMEZarrFileWriter:
+    def __init__(self, parent):
+        self.parent = parent
+
+    def description(self):
+        return _("OME-Zarr image")
+
+    def fileType(self):
+        return "OMEZarr"
+
+    def extensions(self, obj):
+        # The second, generic filter lets a label map be written as ``<image>/labels/<name>``.
+        return [_("OME-Zarr") + " (.ome.zarr)", _("OME-Zarr directory") + " (*)"]
+
+    def canWriteObjectConfidence(self, obj):
+        # Below the default 0.5 so NRRD stays the default choice in the save dialog.
+        if obj.IsA("vtkMRMLLabelMapVolumeNode") or obj.IsA("vtkMRMLScalarVolumeNode"):
+            return 0.3
+        return 0.0
+
+    def write(self, properties):
+        try:
+            node = slicer.mrmlScene.GetNodeByID(properties["nodeID"])
+            with Progress(_("Writing OME-Zarr...")) as progress:
+                OMEZarrLogic.writeVolume(node, properties["fileName"], progress)
+        except Exception as e:  # noqa: BLE001 - report everything to the user
+            import traceback
+
+            traceback.print_exc()
+            self.parent.userMessages().AddMessage(vtk.vtkCommand.ErrorEvent, f"Failed to write OME-Zarr: {e}")
+            return False
+        self.parent.writtenNodes = [node.GetID()]
+        return True
 
 
 #
@@ -694,7 +1266,7 @@ class OMEZarrFileDialog:
 
 
 #
-# Widget (minimal: inspect levels, load a level, load a region of interest)
+# Widget
 #
 
 
@@ -707,17 +1279,20 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.multiscales = None
         self.path = None
 
-        formLayout = qt.QFormLayout()
-        self.layout.addLayout(formLayout)
+        # -- Store --
+        storeBox = ctk.ctkCollapsibleButton()
+        storeBox.text = _("Store")
+        self.layout.addWidget(storeBox)
+        storeLayout = qt.QFormLayout(storeBox)
 
         self.pathEdit = ctk.ctkPathLineEdit()
         self.pathEdit.filters = ctk.ctkPathLineEdit.Dirs
         self.pathEdit.settingKey = "OMEZarr/LastPath"
         self.pathEdit.setToolTip(_("Local .ome.zarr directory, .ozx file, or https:// / s3:// URL"))
-        formLayout.addRow(_("Store:"), self.pathEdit)
+        storeLayout.addRow(_("Store:"), self.pathEdit)
 
         self.inspectButton = qt.QPushButton(_("Inspect"))
-        formLayout.addRow(self.inspectButton)
+        storeLayout.addRow(self.inspectButton)
 
         self.levelTable = qt.QTableWidget(0, 6)
         self.levelTable.setHorizontalHeaderLabels(
@@ -726,24 +1301,38 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.levelTable.horizontalHeader().setStretchLastSection(True)
         self.levelTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
         self.levelTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
-        formLayout.addRow(self.levelTable)
+        storeLayout.addRow(self.levelTable)
+
+        self.infoLabel = qt.QLabel()
+        self.infoLabel.wordWrap = True
+        storeLayout.addRow(self.infoLabel)
 
         self.levelSelector = qt.QComboBox()
-        formLayout.addRow(_("Level:"), self.levelSelector)
-
-        self.maxBytesSpinBox = qt.QSpinBox()
-        self.maxBytesSpinBox.setRange(1, 1 << 20)
-        self.maxBytesSpinBox.setSuffix(" MiB")
-        self.maxBytesSpinBox.setValue(max(1, self.logic.maxBytesFromSettings() >> 20))
-        self.maxBytesSpinBox.setToolTip(_("Automatic level selection budget used when dropping a store into Slicer"))
-        formLayout.addRow(_("Memory budget:"), self.maxBytesSpinBox)
+        storeLayout.addRow(_("Level:"), self.levelSelector)
 
         self.timeIndexSpinBox = qt.QSpinBox()
-        self.timeIndexSpinBox.setRange(0, 0)
-        formLayout.addRow(_("Time index:"), self.timeIndexSpinBox)
+        self.timeIndexSpinBox.setRange(-1, -1)
+        self.timeIndexSpinBox.setSpecialValueText(_("all (sequence)"))
+        storeLayout.addRow(_("Time point:"), self.timeIndexSpinBox)
 
         self.loadButton = qt.QPushButton(_("Load level"))
-        formLayout.addRow(self.loadButton)
+        storeLayout.addRow(self.loadButton)
+
+        # -- Refine --
+        refineBox = ctk.ctkCollapsibleButton()
+        refineBox.text = _("Finer resolution")
+        self.layout.addWidget(refineBox)
+        refineLayout = qt.QFormLayout(refineBox)
+
+        self.viewSelector = qt.QComboBox()
+        self.viewSelector.addItems(["Red", "Yellow", "Green"])
+        refineLayout.addRow(_("Slice view:"), self.viewSelector)
+
+        self.refineButton = qt.QPushButton(_("Refine current view"))
+        self.refineButton.setToolTip(
+            _("Reload the block shown by the slice view at the finest level that fits the memory budget")
+        )
+        refineLayout.addRow(self.refineButton)
 
         self.roiSelector = slicer.qMRMLNodeComboBox()
         self.roiSelector.nodeTypes = ["vtkMRMLMarkupsROINode"]
@@ -751,22 +1340,71 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.roiSelector.removeEnabled = True
         self.roiSelector.noneEnabled = True
         self.roiSelector.setMRMLScene(slicer.mrmlScene)
-        formLayout.addRow(_("Region of interest:"), self.roiSelector)
+        refineLayout.addRow(_("Region of interest:"), self.roiSelector)
 
         self.loadRegionButton = qt.QPushButton(_("Load region at selected level"))
         self.loadRegionButton.setToolTip(_("Reads only the chunks intersecting the ROI"))
-        formLayout.addRow(self.loadRegionButton)
+        refineLayout.addRow(self.loadRegionButton)
+
+        # -- Settings --
+        settingsBox = ctk.ctkCollapsibleButton()
+        settingsBox.text = _("Settings")
+        settingsBox.collapsed = True
+        self.layout.addWidget(settingsBox)
+        settingsLayout = qt.QFormLayout(settingsBox)
+
+        self.maxBytesSpinBox = qt.QSpinBox()
+        self.maxBytesSpinBox.setRange(0, 1 << 20)
+        self.maxBytesSpinBox.setSuffix(" MiB")
+        self.maxBytesSpinBox.setSpecialValueText(_("automatic (25% of free RAM)"))
+        self.maxBytesSpinBox.setValue(Settings.get(Settings.MAX_BYTES, 0) >> 20)
+        self.maxBytesSpinBox.setToolTip(_("Budget for automatic level selection"))
+        settingsLayout.addRow(_("Memory budget:"), self.maxBytesSpinBox)
+
+        self.orientationSelector = qt.QComboBox()
+        self.orientationSelector.addItems(["LPS", "RAS"])
+        self.orientationSelector.setCurrentText(Settings.get(Settings.ORIENTATION, "LPS"))
+        self.orientationSelector.setToolTip(_("How x/y/z axes are interpreted when a store has no RFC-4 orientation"))
+        settingsLayout.addRow(_("Axes without RFC-4:"), self.orientationSelector)
+
+        self.loadLabelsCheckBox = qt.QCheckBox()
+        self.loadLabelsCheckBox.checked = Settings.get(Settings.LOAD_LABELS, True)
+        settingsLayout.addRow(_("Load labels:"), self.loadLabelsCheckBox)
+
+        self.timeModeSelector = qt.QComboBox()
+        self.timeModeSelector.addItem(_("all time points as a Sequence"), "sequence")
+        self.timeModeSelector.addItem(_("first time point only"), "index")
+        self.timeModeSelector.setCurrentIndex(0 if Settings.get(Settings.TIME_MODE, "sequence") == "sequence" else 1)
+        settingsLayout.addRow(_("Time axis:"), self.timeModeSelector)
+
+        self.displayUnitsCheckBox = qt.QCheckBox()
+        self.displayUnitsCheckBox.checked = Settings.get(Settings.DISPLAY_UNITS, False)
+        self.displayUnitsCheckBox.setToolTip(_("Show lengths in the store's unit (µm, nm) instead of mm"))
+        settingsLayout.addRow(_("Display in store units:"), self.displayUnitsCheckBox)
+
+        self.resetUnitsButton = qt.QPushButton(_("Reset display to mm"))
+        settingsLayout.addRow(self.resetUnitsButton)
 
         self.layout.addStretch(1)
 
         self.inspectButton.connect("clicked(bool)", self.onInspect)
         self.loadButton.connect("clicked(bool)", self.onLoad)
+        self.refineButton.connect("clicked(bool)", self.onRefine)
         self.loadRegionButton.connect("clicked(bool)", self.onLoadRegion)
-        self.maxBytesSpinBox.connect("valueChanged(int)", self.onMaxBytesChanged)
         self.levelSelector.connect("currentIndexChanged(int)", self.onLevelChanged)
+        self.maxBytesSpinBox.connect("valueChanged(int)", lambda mib: Settings.set(Settings.MAX_BYTES, int(mib) << 20))
+        self.orientationSelector.connect("currentTextChanged(QString)", lambda t: Settings.set(Settings.ORIENTATION, t))
+        self.loadLabelsCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.LOAD_LABELS, bool(b)))
+        self.timeModeSelector.connect(
+            "currentIndexChanged(int)", lambda i: Settings.set(Settings.TIME_MODE, self.timeModeSelector.itemData(i))
+        )
+        self.displayUnitsCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.DISPLAY_UNITS, bool(b)))
+        self.resetUnitsButton.connect("clicked(bool)", OMEZarrLogic.resetDisplayUnits)
 
-    def onMaxBytesChanged(self, mib):
-        qt.QSettings().setValue(SETTINGS_MAX_BYTES_KEY, int(mib) << 20)
+    def currentPath(self):
+        if not self.path:
+            self.onInspect()
+        return self.path
 
     def onInspect(self):
         path = omeZarrRootFromPath(self.pathEdit.currentPath)
@@ -799,41 +1437,69 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                 self.levelTable.setItem(row, column, qt.QTableWidgetItem(value))
             self.levelSelector.addItem(f"{level['level']}  ({level['bytes'] / 2**20:.1f} MiB)")
         self.levelTable.resizeColumnsToContents()
-        dims = list(self.multiscales.images[0].dims)
-        timePoints = self.multiscales.images[0].data.shape[dims.index("t")] if "t" in dims else 1
-        self.timeIndexSpinBox.setRange(0, max(0, timePoints - 1))
+        image = self.multiscales.images[0]
+        timePoints = self.logic.axisLength(image, "t")
+        self.timeIndexSpinBox.setRange(-1, max(-1, timePoints - 1))
+        self.timeIndexSpinBox.value = -1 if timePoints > 1 else 0
+        _matrix, source = self.logic.ijkToRasMatrix(image, metadata=self.multiscales.metadata)
+        labels = labelGroupNames(path)
+        self.infoLabel.text = _(
+            "Orientation: {source}. Channels: {channels}. Time points: {t}. Labels: {labels}."
+        ).format(
+            source=source,
+            channels=self.logic.axisLength(image, "c"),
+            t=timePoints,
+            labels=", ".join(labels) if labels else _("none"),
+        )
         self.levelSelector.setCurrentIndex(self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings()))
 
     def onLevelChanged(self, index):
         self.loadButton.setEnabled(index >= 0)
 
     def onLoad(self):
-        if not self.path:
-            self.onInspect()
-            if not self.path:
-                return
+        if not self.currentPath():
+            return
+        properties = {"level": self.levelSelector.currentIndex}
+        if self.timeIndexSpinBox.value >= 0:
+            properties["timeIndex"] = self.timeIndexSpinBox.value
         with slicer.util.tryWithErrorDisplay(_("Failed to load level"), waitCursor=True):
-            slicer.util.loadNodeFromFile(
-                self.path,
-                "OMEZarr",
-                {"level": self.levelSelector.currentIndex, "timeIndex": self.timeIndexSpinBox.value},
-            )
+            slicer.util.loadNodeFromFile(self.path, "OMEZarr", properties)
+
+    def onRefine(self):
+        if not self.currentPath():
+            return
+        with slicer.util.tryWithErrorDisplay(_("Failed to refine view")), Progress(_("Refining view...")) as progress:
+            try:
+                self.logic.refineView(
+                    self.path,
+                    self.viewSelector.currentText,
+                    timeIndex=max(0, self.timeIndexSpinBox.value),
+                    progress=progress,
+                )
+            except InterruptedError:
+                pass
 
     def onLoadRegion(self):
         roiNode = self.roiSelector.currentNode()
         if roiNode is None:
             slicer.util.errorDisplay(_("Select a region of interest node first."))
             return
-        if not self.path:
-            self.onInspect()
-            if not self.path:
+        if not self.currentPath():
+            return
+        with slicer.util.tryWithErrorDisplay(_("Failed to load region")), Progress(_("Loading region...")) as progress:
+            try:
+                nodes = self.logic.loadRegion(
+                    self.path,
+                    roiNode,
+                    level=self.levelSelector.currentIndex,
+                    timeIndex=max(0, self.timeIndexSpinBox.value),
+                    progress=progress,
+                )
+            except InterruptedError:
                 return
-        with slicer.util.tryWithErrorDisplay(_("Failed to load region"), waitCursor=True):
-            nodes = self.logic.loadRegion(
-                self.path, roiNode, level=self.levelSelector.currentIndex, timeIndex=self.timeIndexSpinBox.value
-            )
-            if nodes:
-                slicer.util.setSliceViewerLayers(background=nodes[0], fit=True)
+            scalars = [n for n in nodes if not n.IsA("vtkMRMLLabelMapVolumeNode")]
+            if scalars:
+                slicer.util.setSliceViewerLayers(background=scalars[0], fit=True)
 
 
 #
@@ -846,11 +1512,29 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         slicer.mrmlScene.Clear()
         self.tempDir = slicer.util.tempDirectory("OMEZarrTest")
         OMEZarrLogic.clearCache()
+        self.savedSettings = {
+            key: qt.QSettings().value(key)
+            for key in (
+                Settings.MAX_BYTES,
+                Settings.ORIENTATION,
+                Settings.LOAD_LABELS,
+                Settings.TIME_MODE,
+                Settings.DISPLAY_UNITS,
+            )
+        }
+        for key in self.savedSettings:
+            qt.QSettings().remove(key)
 
     def tearDown(self):
         import shutil
 
         shutil.rmtree(self.tempDir, ignore_errors=True)
+        for key, value in self.savedSettings.items():
+            if value is None:
+                qt.QSettings().remove(key)
+            else:
+                qt.QSettings().setValue(key, value)
+        OMEZarrLogic.resetDisplayUnits()
 
     def runTest(self):
         self.setUp()
@@ -860,6 +1544,11 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_LevelSelection()
             self.test_RegionLoading()
             self.test_MicroscopyAxes()
+            self.test_Labels()
+            self.test_TimeSeries()
+            self.test_Writer()
+            self.test_RefineView()
+            self.test_Settings()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -877,6 +1566,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         multiscales = ngff_zarr.to_multiscales(image, scale_factors=[2, 4])
         storePath = os.path.join(self.tempDir, "MRHead.ome.zarr")
         ngff_zarr.to_ome_zarr(storePath, multiscales, overwrite=True)
+        OMEZarrLogic.clearCache()
         return mrHead, storePath
 
     @staticmethod
@@ -884,6 +1574,16 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         matrix = vtk.vtkMatrix4x4()
         volumeNode.GetIJKToRASMatrix(matrix)
         return slicer.util.arrayFromVTKMatrix(matrix)
+
+    @staticmethod
+    def saveAsOmeZarr(node, path):
+        # slicer.util.saveNode ignores properties["fileType"] (it tests hasattr on a dict),
+        # so select the writer through the IO manager as the save dialog does.
+        messages = slicer.vtkMRMLMessageCollection()
+        success = slicer.app.coreIOManager().saveNodes("OMEZarr", {"nodeID": node.GetID(), "fileName": path}, messages)
+        if not success:
+            logging.error(messages.GetAllMessagesAsString())
+        return success
 
     # tests
 
@@ -893,6 +1593,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(str(ioManager.fileTypeFromDescription("OME-Zarr image")), "OMEZarr")
         self.assertIsNone(omeZarrRootFromPath(self.tempDir))
         self.assertEqual(omeZarrRootFromPath("https://example.org/a/b.ome.zarr/"), "https://example.org/a/b.ome.zarr")
+        self.assertGreater(OMEZarrLogic.maxBytesFromSettings(), 0)
 
     def test_RoundTripFromSlicerVolume(self):
         self.delayDisplay("Round trip Slicer volume -> OME-Zarr -> Slicer")
@@ -905,6 +1606,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         loaded = slicer.util.loadNodeFromFile(storePath, "OMEZarr")
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.GetAttribute("OMEZarr.Level"), "0")
+        self.assertEqual(loaded.GetAttribute("OMEZarr.OrientationSource"), "rfc4")
         np.testing.assert_allclose(self.ijkToRasArray(loaded), self.ijkToRasArray(mrHead), atol=1e-6)
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(loaded), slicer.util.arrayFromVolume(mrHead))
 
@@ -921,6 +1623,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         full = OMEZarrLogic.volumeBytes(multiscales.images[0])
         self.assertEqual(OMEZarrLogic.selectLevel(multiscales, full), 0)
         self.assertEqual(OMEZarrLogic.selectLevel(multiscales, full // 4), 1)
+        self.assertEqual(OMEZarrLogic.selectLevel(multiscales, full, copies=2), 1)
         self.assertEqual(OMEZarrLogic.selectLevel(multiscales, 1), 2)
 
         node = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": full // 4})
@@ -953,42 +1656,251 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         expectedOrigin = (ijkToRas @ np.array([i0, j0, k0, 1.0]))[:3]
         np.testing.assert_allclose(self.ijkToRasArray(nodes[0])[:3, 3], expectedOrigin, atol=1e-6)
 
-    def test_MicroscopyAxes(self):
-        self.delayDisplay("c,z,y,x microscopy store in micrometres, two channels")
+    def writeMicroscopyStore(self, name="cells", withTime=False):
         import ngff_zarr
-
-        rng = np.random.default_rng(0)
-        data = rng.integers(0, 4000, size=(2, 12, 30, 40), dtype=np.uint16)
-        image = ngff_zarr.to_ngff_image(
-            data,
-            dims=("c", "z", "y", "x"),
-            scale={"z": 2.0, "y": 0.25, "x": 0.25},
-            translation={"z": 10.0, "y": -5.0, "x": 3.0},
-            axes_units={"z": "micrometer", "y": "micrometer", "x": "micrometer"},
-        )
-        multiscales = ngff_zarr.to_multiscales(image, scale_factors=[2])
         from ngff_zarr import Omero, OmeroChannel, OmeroWindow
 
+        rng = np.random.default_rng(0)
+        shape = (3, 2, 12, 30, 40) if withTime else (2, 12, 30, 40)
+        dims = ("t", "c", "z", "y", "x") if withTime else ("c", "z", "y", "x")
+        data = rng.integers(0, 4000, size=shape, dtype=np.uint16)
+        scale = {"z": 2.0, "y": 0.25, "x": 0.25}
+        translation = {"z": 10.0, "y": -5.0, "x": 3.0}
+        units = {"z": "micrometer", "y": "micrometer", "x": "micrometer"}
+        if withTime:
+            scale["t"], translation["t"], units["t"] = 0.5, 0.0, "second"
+        image = ngff_zarr.to_ngff_image(data, dims=dims, scale=scale, translation=translation, axes_units=units)
+        multiscales = ngff_zarr.to_multiscales(image, scale_factors=[2])
         multiscales.metadata.omero = Omero(
             channels=[
                 OmeroChannel(color="0000FF", window=OmeroWindow(0, 4000, 100, 3000), label="DAPI"),
                 OmeroChannel(color="00FF00", window=OmeroWindow(0, 4000, 200, 2500), label="GFP"),
             ]
         )
-        storePath = os.path.join(self.tempDir, "cells.ome.zarr")
+        storePath = os.path.join(self.tempDir, f"{name}.ome.zarr")
         ngff_zarr.to_ome_zarr(storePath, multiscales, overwrite=True)
+        OMEZarrLogic.clearCache()
+        return data, storePath
 
+    def test_MicroscopyAxes(self):
+        self.delayDisplay("c,z,y,x microscopy store in micrometres, two channels")
+        data, storePath = self.writeMicroscopyStore()
         nodes = OMEZarrLogic.loadImage(storePath, level=0)
         self.assertEqual([n.GetName() for n in nodes], ["cells_DAPI", "cells_GFP"])
         self.assertEqual(nodes[0].GetDisplayNode().GetColorNodeID(), "vtkMRMLColorTableNodeBlue")
         self.assertEqual(nodes[1].GetDisplayNode().GetColorNodeID(), "vtkMRMLColorTableNodeGreen")
         self.assertAlmostEqual(nodes[1].GetDisplayNode().GetWindow(), 2300.0)
+        self.assertEqual(nodes[0].GetAttribute("OMEZarr.OrientationSource"), "assumed-LPS")
         for channel, node in enumerate(nodes):
             np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), data[channel])
             np.testing.assert_allclose(node.GetSpacing(), [0.25e-3, 0.25e-3, 2.0e-3])
             # LPS origin (3, -5, 10) um -> RAS (-3, 5, 10) um -> mm
             np.testing.assert_allclose(node.GetOrigin(), [-3.0e-3, 5.0e-3, 10.0e-3])
             self.assertEqual(node.GetAttribute("OMEZarr.LengthUnit"), "micrometer")
+
+        # The RAS assumption keeps x/y unflipped.
+        Settings.set(Settings.ORIENTATION, "RAS")
+        node = OMEZarrLogic.loadImage(storePath, level=0, channels=[0])[0]
+        self.assertEqual(node.GetAttribute("OMEZarr.OrientationSource"), "assumed-RAS")
+        np.testing.assert_allclose(node.GetOrigin(), [3.0e-3, -5.0e-3, 10.0e-3])
+        Settings.set(Settings.ORIENTATION, "LPS")
+
+    def test_Labels(self):
+        self.delayDisplay("Labels group loads as a label map with its colour table")
+        import ngff_zarr
+
+        data, storePath = self.writeMicroscopyStore("labelled")
+        labelData = np.zeros(data.shape[1:], dtype=np.uint16)
+        labelData[2:6, 5:15, 10:20] = 1
+        labelData[6:10, 15:25, 20:35] = 3
+        labelImage = ngff_zarr.to_ngff_image(
+            labelData,
+            dims=("z", "y", "x"),
+            scale={"z": 2.0, "y": 0.25, "x": 0.25},
+            translation={"z": 10.0, "y": -5.0, "x": 3.0},
+            axes_units={"z": "micrometer", "y": "micrometer", "x": "micrometer"},
+        )
+        labelPath = os.path.join(storePath, "labels", "nuclei")
+        ngff_zarr.to_ome_zarr(
+            labelPath,
+            ngff_zarr.to_multiscales(labelImage, scale_factors=[2], method=ngff_zarr.Methods.ITKWASM_LABEL_IMAGE),
+        )
+        OMEZarrLogic.addImageLabelMetadata(
+            labelPath,
+            {
+                "version": "0.5",
+                "colors": [{"label-value": 1, "rgba": [255, 0, 0, 255]}, {"label-value": 3, "rgba": [0, 0, 255, 128]}],
+                "properties": [{"label-value": 1, "name": "nucleus"}, {"label-value": 3, "name": "cytoplasm"}],
+            },
+        )
+        OMEZarrLogic.registerLabelInParent(labelPath)
+        self.assertEqual(labelGroupNames(storePath), ["nuclei"])
+        self.assertTrue(isLabelStore(labelPath))
+        OMEZarrLogic.clearCache()
+
+        nodes = OMEZarrLogic.loadImage(storePath, level=0)
+        labelNodes = [n for n in nodes if n.IsA("vtkMRMLLabelMapVolumeNode")]
+        self.assertEqual(len(nodes), 3)
+        self.assertEqual(len(labelNodes), 1)
+        labelNode = labelNodes[0]
+        self.assertEqual(labelNode.GetName(), "labelled_nuclei")
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(labelNode), labelData)
+        np.testing.assert_allclose(self.ijkToRasArray(labelNode), self.ijkToRasArray(nodes[0]), atol=1e-9)
+        colorNode = labelNode.GetDisplayNode().GetColorNode()
+        self.assertEqual(colorNode.GetColorName(1), "nucleus")
+        self.assertEqual(colorNode.GetColorName(3), "cytoplasm")
+        rgba = [0.0] * 4
+        colorNode.GetColor(3, rgba)
+        np.testing.assert_allclose(rgba, [0.0, 0.0, 1.0, 128 / 255.0], atol=1e-6)
+
+        # Region loading and a lower level carry the labels along.
+        nodes = OMEZarrLogic.loadImage(storePath, level=1, channels=[0])
+        self.assertEqual([n.GetAttribute("OMEZarr.Level") for n in nodes], ["1", "1"])
+        self.assertTrue(nodes[1].IsA("vtkMRMLLabelMapVolumeNode"))
+        np.testing.assert_allclose(nodes[1].GetSpacing(), nodes[0].GetSpacing())
+
+        # A label store dropped on its own loads as a label map too.
+        direct = slicer.util.loadNodeFromFile(labelPath, "OMEZarr")
+        self.assertTrue(direct.IsA("vtkMRMLLabelMapVolumeNode"))
+
+        # The setting turns labels off.
+        nodes = OMEZarrLogic.loadImage(storePath, level=0, labels=False)
+        self.assertEqual(len(nodes), 2)
+
+    def test_TimeSeries(self):
+        self.delayDisplay("Time axis loads as a Sequence, or as one time point")
+        data, storePath = self.writeMicroscopyStore("timelapse", withTime=True)
+        nodes = OMEZarrLogic.loadImage(storePath, level=0)
+        self.assertEqual(len(nodes), 2)
+        browsers = slicer.util.getNodesByClass("vtkMRMLSequenceBrowserNode")
+        self.assertEqual(len(browsers), 1)
+        browser = browsers[0]
+        sequence = browser.GetMasterSequenceNode()
+        self.assertEqual(sequence.GetNumberOfDataNodes(), 3)
+        self.assertEqual(sequence.GetIndexUnit(), "second")
+        self.assertEqual(sequence.GetNthIndexValue(2), "1")
+        browser.SetSelectedItemNumber(2)
+        slicer.modules.sequences.logic().UpdateProxyNodesFromSequences(browser)
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(nodes[0]), data[2, 0])
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(nodes[1]), data[2, 1])
+
+        # Budget accounts for every time point and channel.
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        single = OMEZarrLogic.volumeBytes(multiscales.images[0])
+        self.assertEqual(OMEZarrLogic.selectLevel(multiscales, single * 6, copies=6), 0)
+        self.assertEqual(OMEZarrLogic.selectLevel(multiscales, single * 6 - 1, copies=6), 1)
+
+        node = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 0, "timeIndex": 1})
+        self.assertFalse(node.IsA("vtkMRMLSequenceNode"))
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), data[1, 0])
+        self.assertEqual(node.GetAttribute("OMEZarr.TimeIndex"), "1")
+
+        Settings.set(Settings.TIME_MODE, "index")
+        node = OMEZarrLogic.loadImage(storePath, level=0, channels=[1])[0]
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), data[0, 1])
+        Settings.set(Settings.TIME_MODE, "sequence")
+
+    def test_Writer(self):
+        self.delayDisplay("Scalar and label map volumes are written and read back")
+        import SampleData
+
+        mrHead = SampleData.SampleDataLogic().downloadMRHead()
+        storePath = os.path.join(self.tempDir, "written.ome.zarr")
+        self.assertTrue(self.saveAsOmeZarr(mrHead, storePath))
+        self.assertTrue(os.path.isfile(os.path.join(storePath, "zarr.json")))
+        loaded = OMEZarrLogic.loadImage(storePath, level=0)[0]
+        np.testing.assert_allclose(self.ijkToRasArray(loaded), self.ijkToRasArray(mrHead), atol=1e-6)
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(loaded), slicer.util.arrayFromVolume(mrHead))
+        self.assertGreater(len(OMEZarrLogic.openMultiscales(storePath).images), 1)
+
+        labelArray = np.zeros(slicer.util.arrayFromVolume(mrHead).shape, dtype=np.uint8)
+        labelArray[40:80, 100:150, 100:160] = 2
+        labelNode = slicer.util.addVolumeFromArray(
+            labelArray, ijkToRAS=self.ijkToRasArray(mrHead), name="mask", nodeClassName="vtkMRMLLabelMapVolumeNode"
+        )
+        labelNode.CreateDefaultDisplayNodes()
+        colorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLColorTableNode", "maskColors")
+        colorNode.SetTypeToUser()
+        colorNode.SetNumberOfColors(3)
+        colorNode.SetColor(2, "lesion", 1.0, 0.5, 0.0, 1.0)
+        labelNode.GetDisplayNode().SetAndObserveColorNodeID(colorNode.GetID())
+        labelPath = os.path.join(storePath, "labels", "mask")
+        self.assertTrue(self.saveAsOmeZarr(labelNode, labelPath))
+        self.assertTrue(isLabelStore(labelPath))
+        self.assertEqual(labelGroupNames(storePath), ["mask"])
+        imageLabel = readStoreAttributes(labelPath)["image-label"]
+        self.assertEqual(imageLabel["properties"], [{"label-value": 2, "name": "lesion"}])
+        self.assertEqual(imageLabel["colors"][0]["rgba"], [255, 128, 0, 255])
+
+        OMEZarrLogic.clearCache()
+        nodes = OMEZarrLogic.loadImage(storePath, level=0)
+        self.assertEqual(len(nodes), 2)
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(nodes[1]), labelArray)
+        self.assertEqual(nodes[1].GetDisplayNode().GetColorNode().GetColorName(2), "lesion")
+
+    def test_RefineView(self):
+        self.delayDisplay("Refining a slice view reloads its block at a finer level")
+        mrHead, storePath = self.writeMRHeadStore()
+        full = slicer.util.arrayFromVolume(mrHead)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4
+        coarse = OMEZarrLogic.loadImage(storePath, maxBytes=budget)[0]
+        self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "1")
+        slicer.util.setSliceViewerLayers(background=coarse, fit=True)
+
+        sliceNode = slicer.app.layoutManager().sliceWidget("Red").mrmlSliceNode()
+        sliceNode.SetOrientationToAxial()
+        center = np.array(mrHead.GetOrigin())
+        bounds = [0.0] * 6
+        mrHead.GetRASBounds(bounds)
+        center = np.array([(bounds[0] + bounds[1]) / 2, (bounds[2] + bounds[3]) / 2, (bounds[4] + bounds[5]) / 2])
+        sliceNode.JumpSliceByCentering(*center)
+        sliceNode.SetFieldOfView(40.0, 40.0, 1.0)
+
+        nodes = OMEZarrLogic.refineView(storePath, "Red", maxBytes=budget)
+        self.assertEqual(len(nodes), 1)
+        refined = nodes[0]
+        self.assertEqual(refined.GetAttribute("OMEZarr.Level"), "0")
+        self.assertEqual(refined.GetAttribute("OMEZarr.Refined"), "1")
+        array = slicer.util.arrayFromVolume(refined)
+        self.assertLess(array.size, full.size // 8)
+        # The refined block is a verbatim sub-block of the full-resolution image.
+        rasToIjk = np.linalg.inv(self.ijkToRasArray(mrHead))
+        start = np.rint((rasToIjk @ np.append(self.ijkToRasArray(refined)[:3, 3], 1.0))[:3]).astype(int)
+        k, j, i = array.shape
+        np.testing.assert_array_equal(
+            array, full[start[2] : start[2] + k, start[1] : start[1] + j, start[0] : start[0] + i]
+        )
+        redLogic = slicer.app.layoutManager().sliceWidget("Red").sliceLogic()
+        self.assertEqual(redLogic.GetForegroundLayer().GetVolumeNode().GetID(), refined.GetID())
+
+        # A second refinement replaces the first.
+        nodes = OMEZarrLogic.refineView(storePath, "Red", maxBytes=budget)
+        self.assertEqual(
+            len(
+                [n for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode") if n.GetAttribute("OMEZarr.Refined")]
+            ),
+            1,
+        )
+
+    def test_Settings(self):
+        self.delayDisplay("Display units follow the store when enabled")
+        data, storePath = self.writeMicroscopyStore("units")
+        unitNode = slicer.mrmlScene.GetNodeByID("vtkMRMLUnitNodeApplicationLength")
+        OMEZarrLogic.loadImage(storePath, level=0, channels=[0])
+        self.assertEqual(unitNode.GetSuffix(), "mm")
+        Settings.set(Settings.DISPLAY_UNITS, True)
+        OMEZarrLogic.loadImage(storePath, level=0, channels=[0])
+        self.assertEqual(unitNode.GetSuffix(), "µm")
+        self.assertAlmostEqual(unitNode.GetDisplayCoefficient(), 1000.0)
+        OMEZarrLogic.resetDisplayUnits()
+        self.assertEqual(unitNode.GetSuffix(), "mm")
+        Settings.set(Settings.DISPLAY_UNITS, False)
+
+        Settings.set(Settings.MAX_BYTES, 0)
+        self.assertGreater(OMEZarrLogic.maxBytesFromSettings(), FALLBACK_MAX_BYTES // 16)
+        Settings.set(Settings.MAX_BYTES, 12345)
+        self.assertEqual(OMEZarrLogic.maxBytesFromSettings(), 12345)
 
     def test_RemoteStore(self):
         self.delayDisplay("Remote HTTPS store (IDR)")
