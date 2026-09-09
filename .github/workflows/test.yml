@@ -42,12 +42,5 @@ jobs:
           tar -xzf slicer.tar.gz -C slicer --strip-components=1
           rm slicer.tar.gz
 
-      - name: Report missing shared libraries
-        run: |
-          export LD_LIBRARY_PATH="$PWD/slicer/lib/Slicer-5.12:$PWD/slicer/lib/Python/lib"
-          for f in slicer/bin/SlicerApp-real slicer/lib/Slicer-5.12/platforms/libqxcb.so slicer/lib/Slicer-5.12/libvtkRenderingOpenGL2-*.so; do
-            ldd "$f" | grep "not found" || true
-          done | sort -u
-
       - name: Run module self-test
         run: Testing/run_headless_test.sh "$PWD/slicer/Slicer"

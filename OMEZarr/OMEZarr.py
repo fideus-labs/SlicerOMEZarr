@@ -1511,6 +1511,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
     def setUp(self):
         slicer.mrmlScene.Clear()
         self.tempDir = slicer.util.tempDirectory("OMEZarrTest")
+        OMEZarrLogic.ensureNgffZarr()
         OMEZarrLogic.clearCache()
         self.savedSettings = {
             key: qt.QSettings().value(key)
