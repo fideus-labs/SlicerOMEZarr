@@ -37,12 +37,14 @@ first use.
   the module settings. A message says which level was chosen.
 * **Refine current view**: reloads the block shown by a slice view at the
   finest level that fits the budget, reading only the chunks it needs, and
-  overlays it on the coarse volume. It can run automatically each time the
-  view stops moving. Region-of-interest loading does the same for a Markups
-  ROI.
+  overlays it on the coarse volume in that view with the same window/level.
+  Each slice view keeps its own block, and refinement can run automatically
+  in all three views each time a view stops moving. Region-of-interest
+  loading does the same for a Markups ROI. Time series are refined at the
+  time point selected in the sequence browser.
 * **Labels**: the `labels` groups of a store load as label map volumes with
-  the colours and names of their `image-label` metadata. A label store can
-  also be dropped on its own.
+  the colours and names of their `image-label` metadata, or as Segmentation
+  nodes when that setting is on. A label store can also be dropped on its own.
 * **Time series**: the `t` axis loads as a Sequence with a browser, or as a
   single time point.
 * **Axes** `t`, `c`, `z`, `y`, `x` in any order. Channels become separate
@@ -56,7 +58,8 @@ first use.
 * **Writing**: scalar volumes, label maps and segmentations as multiscale
   OME-Zarr, with RFC-4 orientation from the IJK→RAS matrix and `image-label`
   names and colours from the colour table or the segments.
-* **Stores**: local directories, `.ozx` files, `https://` and `s3://`.
+* **Stores**: local directories, `.ozx` files, `https://` and `s3://`, and
+  bioformats2raw containers (every image series is loaded).
 * **Progress and cancel** while reading.
 
 ## Still to do
@@ -66,7 +69,6 @@ first use.
   changes in Slicer core (tracked in issue #1); use drag-and-drop, the
   `zarr.json` file, or the save dialog meanwhile.
 * Writing to remote stores (ngff-zarr writes local directories only).
-* Loading labels as Segmentation nodes rather than label maps.
 * Submission to the Extensions Index once the repository is public.
 
 ## Development
