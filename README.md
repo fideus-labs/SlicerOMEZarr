@@ -9,6 +9,8 @@ OME-Zarr dataset to NIfTI just to look at it. This extension removes that step.
 
 ![Screenshot](Screenshots/main.png)
 
+Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
+
 ## Usage
 
 * Drag an `.ome.zarr` directory onto the Slicer window and pick
