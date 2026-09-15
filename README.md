@@ -29,11 +29,13 @@ With this extension, in Slicer:
 * **Results other tools can read.** Volumes, label maps and segmentations are
   saved as multiscale OME-Zarr, with orientation, label names and colours.
 
-![Walkthrough: drop the store, refine a view, drop the mask](Screenshots/walkthrough.gif)
+![Walkthrough: refine the slice views of a public S3 store, then render it in 3D](Screenshots/walkthrough.gif)
 
-Recorded on an ExaSPIM mouse brain (2.3 GB, 30 µm). Full video with
-captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4)
-(1 min 50). Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
+Recorded on a public CT scan of a chameleon from the
+[OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets),
+read from S3 (2.1 GiB at 0.09 mm). Full video with captions:
+[SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4) (1 min 34).
+Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
 
 ## Usage
 
@@ -50,7 +52,7 @@ captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4)
 
   ```python
   slicer.util.loadNodeFromFile("/data/brain.ome.zarr", "OMEZarr", {"level": 1})
-  slicer.util.loadNodeFromFile("https://host/brain.ome.zarr", "OMEZarr")
+  slicer.util.loadNodeFromFile("s3://ome-zarr-scivis/v0.5/96x2/chameleon.ome.zarr", "OMEZarr")
   ```
 
 Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
