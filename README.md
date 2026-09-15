@@ -4,8 +4,30 @@
 [OME-Zarr](https://ngff.openmicroscopy.org/) (OME-NGFF) images.
 Reading and writing go through [ngff-zarr](https://github.com/fideus-labs/ngff-zarr).
 
-I like working in Slicer, and until now I had to convert every mouse-brain
-OME-Zarr dataset to NIfTI just to look at it. This extension removes that step.
+OME-Zarr, also called OME-NGFF, is an open format for large multidimensional
+images, specified by the [Open Microscopy Environment](https://www.openmicroscopy.org/)
+community. An image is cut into compressed chunks, usually stored at several
+resolutions, and its physical description (voxel spacing, units, orientation,
+channels, labels) is kept next to the pixels as JSON. Imaging archives such as
+the [Image Data Resource](https://idr.openmicroscopy.org/) and collections such
+as the [OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets)
+publish images this way. Stores range from megabytes to terabytes and can live
+on a local disk, a web server or cloud storage; the same store opens in napari,
+Neuroglancer, web viewers and Python.
+
+With this extension, in Slicer:
+
+* **No conversion step.** Drag an `.ome.zarr` directory onto Slicer, or open an
+  `https://` or `s3://` address, without making an NRRD or NIfTI copy first.
+* **Images larger than memory.** The finest resolution level that fits the
+  memory budget loads first. Refine a slice view, with a click or automatically
+  while browsing, and it reloads what it shows at a finer level, up to full
+  resolution, reading only the chunks it needs.
+* **Regular Slicer data.** Images become scalar volumes, labels become label
+  maps or segmentations and time series become sequences, so segmentation,
+  registration and volume rendering work as usual.
+* **Results other tools can read.** Volumes, label maps and segmentations are
+  saved as multiscale OME-Zarr, with orientation, label names and colours.
 
 ![Walkthrough: drop the store, refine a view, drop the mask](Screenshots/walkthrough.gif)
 
