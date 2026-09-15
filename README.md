@@ -31,8 +31,8 @@ captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4)
   slicer.util.loadNodeFromFile("https://host/brain.ome.zarr", "OMEZarr")
   ```
 
-The `ngff-zarr[remote]` Python package is installed into Slicer's Python on
-first use.
+Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
+0.46.1 or newer, is installed into Slicer's Python on first use.
 
 ## What works
 
