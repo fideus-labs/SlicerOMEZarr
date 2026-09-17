@@ -1670,6 +1670,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.logic = OMEZarrLogic()
         self.multiscales = None
         self.path = None
+        self._inspecting = False
 
         # -- Store --
         storeBox = ctk.ctkCollapsibleButton()
@@ -1703,7 +1704,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         storeLayout.addRow(_("Level:"), self.levelSelector)
 
         self.timeIndexSpinBox = qt.QSpinBox()
-        self.timeIndexSpinBox.setRange(-1, -1)
+        self.timeIndexSpinBox.setRange(0, 0)
         self.timeIndexSpinBox.setSpecialValueText(_("all (sequence)"))
         storeLayout.addRow(_("Time point:"), self.timeIndexSpinBox)
 
@@ -1808,6 +1809,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.layout.addStretch(1)
 
         self.inspectButton.connect("clicked(bool)", self.onInspect)
+        self.pathEdit.connect("currentPathChanged(QString)", self.onPathChanged)
         self.loadButton.connect("clicked(bool)", self.onLoad)
         self.refineButton.connect("clicked(bool)", self.onRefine)
         self.autoRefineCheckBox.connect("toggled(bool)", self.onAutoRefineToggled)
@@ -1832,6 +1834,35 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             "editingFinished()", lambda: Settings.set(Settings.STORAGE_OPTIONS, self.storageOptionsEdit.text)
         )
 
+    def enter(self):
+        """Show the store of the displayed OME-Zarr volume, else the last one used."""
+        if self.path:
+            return
+        sliceWidget = slicer.app.layoutManager().sliceWidget("Red")
+        background = sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode() if sliceWidget else None
+        candidates = [background, *slicer.util.getNodesByClass("vtkMRMLVolumeNode")[::-1]]
+        stored = next(
+            (n.GetAttribute("OMEZarr.Path") for n in candidates if n and n.GetAttribute("OMEZarr.Path")), None
+        )
+        if stored and not samePath(stored, self.pathEdit.currentPath):
+            self.pathEdit.currentPath = stored  # triggers onPathChanged
+        else:
+            self.onPathChanged(self.pathEdit.currentPath)
+
+    def onPathChanged(self, path):
+        """Inspect as soon as the path names a store; stay quiet while it does not."""
+        if self._inspecting:
+            return
+        if omeZarrRootFromPath(path):
+            if not samePath(path, self.path):
+                self.onInspect()
+        else:
+            self.path = None
+            self.multiscales = None
+            self.levelTable.setRowCount(0)
+            self.levelSelector.clear()
+            self.infoLabel.text = _("Choose an OME-Zarr store: its resolution levels are listed here.")
+
     def currentPath(self):
         if not self.path:
             self.onInspect()
@@ -1842,6 +1873,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         if not path:
             slicer.util.errorDisplay(_("Not an OME-Zarr multiscales store."))
             return
+        self._inspecting = True  # adding the path to the history re-emits currentPathChanged
+        try:
+            self._inspect(path)
+        finally:
+            self._inspecting = False
+
+    def _inspect(self, path):
         with slicer.util.tryWithErrorDisplay(_("Failed to open store"), waitCursor=True):
             self.multiscales = self.logic.openMultiscales(path, useCache=False)
             self.path = path
@@ -1870,7 +1908,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.levelTable.resizeColumnsToContents()
         image = self.multiscales.images[0]
         timePoints = self.logic.axisLength(image, "t")
-        self.timeIndexSpinBox.setRange(-1, max(-1, timePoints - 1))
+        self.timeIndexSpinBox.setRange(-1 if timePoints > 1 else 0, max(0, timePoints - 1))
         self.timeIndexSpinBox.value = -1 if timePoints > 1 else 0
         _matrix, source = self.logic.ijkToRasMatrix(image)
         labels = labelGroupNames(path)
@@ -2007,6 +2045,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_RefineSkipsWhenNotFiner()
             self.test_StorageOptions()
             self.test_SegmentationWriter()
+            self.test_WidgetInspectsByItself()
             self.test_Settings()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
@@ -2604,6 +2643,26 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertTrue(loaded.IsA("vtkMRMLLabelMapVolumeNode"))
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(loaded), labelArray)
         self.assertEqual(loaded.GetDisplayNode().GetColorNode().GetColorName(2), "ventricle")
+
+    def test_WidgetInspectsByItself(self):
+        self.delayDisplay("The module panel lists the levels without clicking Inspect")
+        if slicer.util.mainWindow() is None:
+            return
+        mrHead, storePath = self.writeMRHeadStore()
+        slicer.util.selectModule("OMEZarr")
+        widget = slicer.modules.OMEZarrWidget
+        widget.pathEdit.currentPath = self.tempDir  # not a store: quiet, empty
+        self.assertEqual(widget.levelTable.rowCount, 0)
+        widget.pathEdit.currentPath = storePath
+        self.assertEqual(widget.levelTable.rowCount, 3)
+        self.assertEqual(widget.timeIndexSpinBox.minimum, 0)
+        # Entering the module with an OME-Zarr volume displayed fills the path.
+        widget.pathEdit.currentPath = self.tempDir
+        node = OMEZarrLogic.loadImage(storePath, level=2)[0]
+        slicer.util.setSliceViewerLayers(background=node)
+        widget.enter()
+        self.assertTrue(samePath(widget.pathEdit.currentPath, storePath))
+        self.assertEqual(widget.levelTable.rowCount, 3)
 
     def test_Settings(self):
         self.delayDisplay("Display units follow the store when enabled")
