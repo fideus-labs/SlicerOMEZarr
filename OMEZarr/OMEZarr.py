@@ -1682,50 +1682,68 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.pathEdit.filters = ctk.ctkPathLineEdit.Dirs
         self.pathEdit.settingKey = "OMEZarr/LastPath"
         self.pathEdit.setToolTip(_("Local .ome.zarr directory, .ozx file, or https:// / s3:// URL"))
-        storeLayout.addRow(_("Store:"), self.pathEdit)
+        self.inspectButton = qt.QToolButton()
+        self.inspectButton.setIcon(slicer.app.style().standardIcon(qt.QStyle.SP_BrowserReload))
+        self.inspectButton.setToolTip(_("Read the store's metadata again"))
+        pathRow = qt.QHBoxLayout()
+        pathRow.addWidget(self.pathEdit, 1)
+        pathRow.addWidget(self.inspectButton)
+        storeLayout.addRow(pathRow)
 
-        self.inspectButton = qt.QPushButton(_("Inspect"))
-        storeLayout.addRow(self.inspectButton)
-
-        self.levelTable = qt.QTableWidget(0, 6)
-        self.levelTable.setHorizontalHeaderLabels(
-            [_("Level"), _("Shape"), _("Chunks"), _("Type"), _("Size / volume"), _("Spacing")]
+        self.infoLabel = qt.QLabel(
+            _("Choose an OME-Zarr store, or drop one onto Slicer: its resolution levels are listed here.")
         )
-        self.levelTable.horizontalHeader().setStretchLastSection(True)
-        self.levelTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
-        self.levelTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
-        storeLayout.addRow(self.levelTable)
-
-        self.infoLabel = qt.QLabel()
         self.infoLabel.wordWrap = True
+        self.infoLabel.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
         storeLayout.addRow(self.infoLabel)
 
-        self.levelSelector = qt.QComboBox()
-        storeLayout.addRow(_("Level:"), self.levelSelector)
+        self.levelTable = qt.QTableWidget(0, 4)
+        self.levelTable.setHorizontalHeaderLabels([_("Level"), _("Voxels (x, y, z)"), _("Spacing"), _("Memory")])
+        self.levelTable.setTextElideMode(qt.Qt.ElideRight)
+        self.levelTable.setWordWrap(False)
+        self.levelTable.verticalHeader().setVisible(False)
+        self.levelTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        self.levelTable.setSelectionMode(qt.QAbstractItemView.SingleSelection)
+        self.levelTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
+        self.levelTable.setHorizontalScrollBarPolicy(qt.Qt.ScrollBarAlwaysOff)
+        self.levelTable.setVerticalScrollBarPolicy(qt.Qt.ScrollBarAlwaysOff)
+        header = self.levelTable.horizontalHeader()
+        header.setSectionResizeMode(qt.QHeaderView.Stretch)
+        for column in (0, 1, 3):
+            header.setSectionResizeMode(column, qt.QHeaderView.ResizeToContents)
+        storeLayout.addRow(self.levelTable)
 
+        self.legendLabel = qt.QLabel(_("Bold: the level the memory budget selects. ✓: loaded in the scene."))
+        self.legendLabel.wordWrap = True
+        self.legendLabel.enabled = False  # greyed like a hint, in any Slicer style
+        storeLayout.addRow(self.legendLabel)
+
+        self.timeIndexLabel = qt.QLabel(_("Time point:"))
         self.timeIndexSpinBox = qt.QSpinBox()
         self.timeIndexSpinBox.setRange(0, 0)
         self.timeIndexSpinBox.setSpecialValueText(_("all (sequence)"))
-        storeLayout.addRow(_("Time point:"), self.timeIndexSpinBox)
+        storeLayout.addRow(self.timeIndexLabel, self.timeIndexSpinBox)
 
-        self.loadButton = qt.QPushButton(_("Load level"))
+        self.loadButton = qt.QPushButton(_("Load selected level"))
         storeLayout.addRow(self.loadButton)
 
-        # -- Refine --
+        # -- Full resolution --
         refineBox = ctk.ctkCollapsibleButton()
-        refineBox.text = _("Finer resolution")
+        refineBox.text = _("Full resolution")
         self.layout.addWidget(refineBox)
         refineLayout = qt.QFormLayout(refineBox)
 
         self.viewSelector = qt.QComboBox()
         self.viewSelector.addItems(["Red", "Yellow", "Green"])
-        refineLayout.addRow(_("Slice view:"), self.viewSelector)
-
-        self.refineButton = qt.QPushButton(_("Refine current view"))
+        self.viewSelector.setToolTip(_("Slice view to refine"))
+        self.refineButton = qt.QPushButton(_("Refine view"))
         self.refineButton.setToolTip(
             _("Reload the block shown by the slice view at the finest level that fits the memory budget")
         )
-        refineLayout.addRow(self.refineButton)
+        refineRow = qt.QHBoxLayout()
+        refineRow.addWidget(self.viewSelector)
+        refineRow.addWidget(self.refineButton, 1)
+        refineLayout.addRow(_("Slice view:"), refineRow)
 
         self.autoRefineCheckBox = qt.QCheckBox(_("Refine the slice views automatically while browsing"))
         self.autoRefineCheckBox.setToolTip(_("Reloads a view's block after it has been still for half a second"))
@@ -1737,11 +1755,18 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.roiSelector.removeEnabled = True
         self.roiSelector.noneEnabled = True
         self.roiSelector.setMRMLScene(slicer.mrmlScene)
-        refineLayout.addRow(_("Region of interest:"), self.roiSelector)
+        self.loadRegionButton = qt.QPushButton(_("Load region"))
+        self.loadRegionButton.setToolTip(
+            _("Load the ROI at the selected level; only the chunks it intersects are read")
+        )
+        roiRow = qt.QHBoxLayout()
+        roiRow.addWidget(self.roiSelector, 1)
+        roiRow.addWidget(self.loadRegionButton)
+        refineLayout.addRow(_("Region of interest:"), roiRow)
 
-        self.loadRegionButton = qt.QPushButton(_("Load region at selected level"))
-        self.loadRegionButton.setToolTip(_("Reads only the chunks intersecting the ROI"))
-        refineLayout.addRow(self.loadRegionButton)
+        self.statusLabel = qt.QLabel()
+        self.statusLabel.wordWrap = True
+        refineLayout.addRow(self.statusLabel)
 
         # -- Settings --
         settingsBox = ctk.ctkCollapsibleButton()
@@ -1814,7 +1839,10 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.refineButton.connect("clicked(bool)", self.onRefine)
         self.autoRefineCheckBox.connect("toggled(bool)", self.onAutoRefineToggled)
         self.loadRegionButton.connect("clicked(bool)", self.onLoadRegion)
-        self.levelSelector.connect("currentIndexChanged(int)", self.onLevelChanged)
+        self.levelTable.connect("itemSelectionChanged()", self.updateButtons)
+        self.levelTable.connect("cellDoubleClicked(int,int)", lambda row, column: self.onLoad())
+        self.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", lambda node: self.updateButtons())
+        self.updateButtons()
         self.maxBytesSpinBox.connect("valueChanged(int)", lambda mib: Settings.set(Settings.MAX_BYTES, int(mib) << 20))
         self.orientationSelector.connect("currentTextChanged(QString)", lambda t: Settings.set(Settings.ORIENTATION, t))
         self.loadLabelsCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.LOAD_LABELS, bool(b)))
@@ -1837,6 +1865,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
     def enter(self):
         """Show the store of the displayed OME-Zarr volume, else the last one used."""
         if self.path:
+            self.updateLevelStatus()
             return
         sliceWidget = slicer.app.layoutManager().sliceWidget("Red")
         background = sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode() if sliceWidget else None
@@ -1860,13 +1889,33 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             self.path = None
             self.multiscales = None
             self.levelTable.setRowCount(0)
-            self.levelSelector.clear()
-            self.infoLabel.text = _("Choose an OME-Zarr store: its resolution levels are listed here.")
+            self.fitTableHeight()
+            self.infoLabel.text = _(
+                "Choose an OME-Zarr store, or drop one onto Slicer: its resolution levels are listed here."
+            )
+            self.updateButtons()
 
     def currentPath(self):
         if not self.path:
             self.onInspect()
         return self.path
+
+    def selectedLevel(self):
+        rows = self.levelTable.selectionModel().selectedRows() if self.levelTable.rowCount else []
+        return rows[0].row() if rows else -1
+
+    def updateButtons(self):
+        hasStore = self.path is not None
+        self.loadButton.setEnabled(hasStore and self.selectedLevel() >= 0)
+        self.refineButton.setEnabled(hasStore)
+        self.autoRefineCheckBox.setEnabled(hasStore)
+        self.loadRegionButton.setEnabled(hasStore and self.roiSelector.currentNode() is not None)
+
+    def fitTableHeight(self):
+        """Size the table to its rows so that it never shows an empty area."""
+        table = self.levelTable
+        rows = sum(table.rowHeight(row) for row in range(table.rowCount)) or table.verticalHeader().defaultSectionSize
+        table.setFixedHeight(table.horizontalHeader().height + rows + 2 * table.frameWidth)
 
     def onInspect(self):
         path = omeZarrRootFromPath(self.pathEdit.currentPath)
@@ -1878,6 +1927,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             self._inspect(path)
         finally:
             self._inspecting = False
+        self.updateButtons()
+
+    @staticmethod
+    def unitSymbol(unit):
+        return {"micrometer": "µm", "micron": "µm", "millimeter": "mm", "nanometer": "nm", "centimeter": "cm"}.get(
+            unit, unit or ""
+        )
 
     def _inspect(self, path):
         with slicer.util.tryWithErrorDisplay(_("Failed to open store"), waitCursor=True):
@@ -1888,65 +1944,119 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             return
         info = self.logic.levelInfo(self.multiscales)
         self.levelTable.setRowCount(len(info))
-        self.levelSelector.clear()
         for row, level in enumerate(info):
+            shape = dict(zip(level["dims"], level["shape"], strict=False))
+            unit = self.unitSymbol(next((level["units"].get(d) for d in SPATIAL_DIMS if level["units"].get(d)), None))
             values = [
                 str(level["level"]),
-                " x ".join(f"{d}:{n}" for d, n in zip(level["dims"], level["shape"], strict=False)),
-                " x ".join(str(n) for n in level["chunks"]),
-                level["dtype"],
-                f"{level['bytes'] / 2**20:.1f} MiB",
-                ", ".join(
-                    f"{d}={level['scale'][d]:g} {level['units'].get(d) or ''}".strip()
-                    for d in SPATIAL_DIMS
-                    if d in level["scale"]
-                ),
+                " × ".join(str(shape[d]) for d in SPATIAL_DIMS if d in shape),
+                (" × ".join(f"{level['scale'][d]:g}" for d in SPATIAL_DIMS if d in shape) + f" {unit}").strip(),
+                self.formatBytes(level["bytes"]),
             ]
             for column, value in enumerate(values):
-                self.levelTable.setItem(row, column, qt.QTableWidgetItem(value))
-            self.levelSelector.addItem(f"{level['level']}  ({level['bytes'] / 2**20:.1f} MiB)")
-        self.levelTable.resizeColumnsToContents()
+                item = qt.QTableWidgetItem(value)
+                item.setToolTip(value)
+                if column == 3:
+                    item.setTextAlignment(qt.Qt.AlignRight | qt.Qt.AlignVCenter)
+                self.levelTable.setItem(row, column, item)
+        self.fitTableHeight()
+
         image = self.multiscales.images[0]
+        channels = self.logic.axisLength(image, "c")
         timePoints = self.logic.axisLength(image, "t")
         self.timeIndexSpinBox.setRange(-1 if timePoints > 1 else 0, max(0, timePoints - 1))
         self.timeIndexSpinBox.value = -1 if timePoints > 1 else 0
+        self.timeIndexLabel.setVisible(timePoints > 1)
+        self.timeIndexSpinBox.setVisible(timePoints > 1)
         _matrix, source = self.logic.ijkToRasMatrix(image)
         labels = labelGroupNames(path)
-        self.infoLabel.text = _(
-            "Orientation: {source}. Channels: {channels}. Time points: {t}. Labels: {labels}."
-        ).format(
-            source=source,
-            channels=self.logic.axisLength(image, "c"),
-            t=timePoints,
-            labels=", ".join(labels) if labels else _("none"),
+        orientation = _("RFC-4 orientation") if source == "rfc4" else _("axes {0}").format(source.replace("-", " "))
+        self.infoLabel.text = " · ".join(
+            [
+                info[0]["dtype"],
+                _("{n} channel(s)").format(n=channels),
+                _("{n} time point(s)").format(n=timePoints),
+                _("labels: {names}").format(names=", ".join(labels)) if labels else _("no labels"),
+                orientation,
+            ]
         )
-        self.levelSelector.setCurrentIndex(self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings()))
+        self.levelTable.selectRow(self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings()))
+        self.updateLevelStatus()
 
-    def onLevelChanged(self, index):
-        self.loadButton.setEnabled(index >= 0)
+    @staticmethod
+    def formatBytes(size):
+        return f"{size / 2**30:.2f} GiB" if size >= 2**30 else f"{size / 2**20:.1f} MiB"
+
+    def updateLevelStatus(self):
+        """Bold the level the budget selects; tick the levels present in the scene."""
+        if not self.path or self.multiscales is None:
+            return
+        recommended = self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings())
+        loaded, regions = set(), set()
+        for node in slicer.util.getNodesByClass("vtkMRMLVolumeNode"):
+            if samePath(node.GetAttribute("OMEZarr.Path"), self.path) and node.GetAttribute("OMEZarr.Level"):
+                target = regions if node.GetAttribute("OMEZarr.Region") else loaded
+                target.add(int(node.GetAttribute("OMEZarr.Level")))
+        for row in range(self.levelTable.rowCount):
+            notes = []
+            if row == recommended:
+                notes.append(_("Selected by the memory budget"))
+            if row in loaded:
+                notes.append(_("Loaded in the scene"))
+            if row in regions:
+                notes.append(_("A region of this level is loaded"))
+            levelItem = self.levelTable.item(row, 0)
+            levelItem.setText(f"{row} ✓" if row in loaded or row in regions else str(row))
+            for column in range(self.levelTable.columnCount):
+                item = self.levelTable.item(row, column)
+                font = item.font()
+                font.setBold(row == recommended)
+                item.setFont(font)
+                if column == 0:
+                    item.setToolTip(". ".join(notes))
 
     def onLoad(self):
-        if not self.currentPath():
+        if not self.currentPath() or self.selectedLevel() < 0:
             return
-        properties = {"level": self.levelSelector.currentIndex}
+        properties = {"level": self.selectedLevel()}
         if self.timeIndexSpinBox.value >= 0:
             properties["timeIndex"] = self.timeIndexSpinBox.value
         with slicer.util.tryWithErrorDisplay(_("Failed to load level"), waitCursor=True):
             slicer.util.loadNodeFromFile(self.path, "OMEZarr", properties)
+        self.updateLevelStatus()
+
+    def describeNodes(self, prefix, nodes):
+        volumes = [n for n in nodes if n.IsA("vtkMRMLScalarVolumeNode") and not n.IsA("vtkMRMLLabelMapVolumeNode")]
+        if not volumes:
+            return prefix
+        dims = volumes[0].GetImageData().GetDimensions()
+        size = sum(n.GetImageData().GetActualMemorySize() for n in volumes) * 1024
+        return _("{prefix}: level {level} · {x} × {y} × {z} voxels · {size}").format(
+            prefix=prefix,
+            level=volumes[0].GetAttribute("OMEZarr.Level"),
+            x=dims[0],
+            y=dims[1],
+            z=dims[2],
+            size=self.formatBytes(size),
+        )
 
     def onRefine(self):
         if not self.currentPath():
             return
-        with slicer.util.tryWithErrorDisplay(_("Failed to refine view")), Progress(_("Refining view...")) as progress:
-            try:
-                self.logic.refineView(
-                    self.path,
-                    self.viewSelector.currentText,
-                    timeIndex=max(0, self.timeIndexSpinBox.value),
-                    progress=progress,
+        view = self.viewSelector.currentText
+        try:
+            with Progress(_("Refining view...")) as progress:
+                nodes = self.logic.refineView(
+                    self.path, view, timeIndex=max(0, self.timeIndexSpinBox.value), progress=progress
                 )
-            except InterruptedError:
-                pass
+            self.statusLabel.text = self.describeNodes(view, nodes)
+        except InterruptedError:
+            self.statusLabel.text = _("{view}: cancelled").format(view=view)
+        except ValueError as e:  # expected refusals are shown in place, not in a popup
+            self.statusLabel.text = f"{view}: {e}"
+        except Exception as e:  # noqa: BLE001
+            slicer.util.errorDisplay(_("Failed to refine view: {error}").format(error=e))
+        self.updateLevelStatus()
 
     def onAutoRefineToggled(self, enabled):
         if not enabled:
@@ -1964,25 +2074,28 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
     def onLoadRegion(self):
         roiNode = self.roiSelector.currentNode()
-        if roiNode is None:
-            slicer.util.errorDisplay(_("Select a region of interest node first."))
+        if roiNode is None or not self.currentPath():
             return
-        if not self.currentPath():
-            return
-        with slicer.util.tryWithErrorDisplay(_("Failed to load region")), Progress(_("Loading region...")) as progress:
-            try:
+        try:
+            with Progress(_("Loading region...")) as progress:
                 nodes = self.logic.loadRegion(
                     self.path,
                     roiNode,
-                    level=self.levelSelector.currentIndex,
+                    level=max(0, self.selectedLevel()),
                     timeIndex=max(0, self.timeIndexSpinBox.value),
                     progress=progress,
                 )
-            except InterruptedError:
-                return
-            scalars = [n for n in nodes if n.IsA("vtkMRMLScalarVolumeNode") and not n.IsA("vtkMRMLLabelMapVolumeNode")]
-            if scalars:
-                slicer.util.setSliceViewerLayers(background=scalars[0], fit=True)
+        except InterruptedError:
+            self.statusLabel.text = _("Region: cancelled")
+            return
+        except ValueError as e:
+            self.statusLabel.text = _("Region: {error}").format(error=e)
+            return
+        scalars = [n for n in nodes if n.IsA("vtkMRMLScalarVolumeNode") and not n.IsA("vtkMRMLLabelMapVolumeNode")]
+        if scalars:
+            slicer.util.setSliceViewerLayers(background=scalars[0], fit=True)
+        self.statusLabel.text = self.describeNodes(roiNode.GetName(), nodes)
+        self.updateLevelStatus()
 
 
 #
@@ -2653,9 +2766,16 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         widget = slicer.modules.OMEZarrWidget
         widget.pathEdit.currentPath = self.tempDir  # not a store: quiet, empty
         self.assertEqual(widget.levelTable.rowCount, 0)
+        self.assertFalse(widget.loadButton.enabled)
         widget.pathEdit.currentPath = storePath
         self.assertEqual(widget.levelTable.rowCount, 3)
         self.assertEqual(widget.timeIndexSpinBox.minimum, 0)
+        self.assertFalse(widget.timeIndexSpinBox.isVisibleTo(widget.parent))
+        self.assertTrue(widget.loadButton.enabled)
+        self.assertEqual(widget.selectedLevel(), 0)  # the default budget fits the full resolution
+        self.assertTrue(widget.levelTable.item(0, 1).font().bold())
+        self.assertFalse(widget.levelTable.item(1, 1).font().bold())
+        self.assertEqual(widget.levelTable.item(0, 1).text(), "256 × 256 × 130")
         # Entering the module with an OME-Zarr volume displayed fills the path.
         widget.pathEdit.currentPath = self.tempDir
         node = OMEZarrLogic.loadImage(storePath, level=2)[0]
@@ -2663,6 +2783,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         widget.enter()
         self.assertTrue(samePath(widget.pathEdit.currentPath, storePath))
         self.assertEqual(widget.levelTable.rowCount, 3)
+        self.assertEqual(widget.levelTable.item(2, 0).text(), "2 ✓")
+        # A refusal is reported in the panel, not in a popup.
+        widget.viewSelector.setCurrentText("Red")
+        Settings.set(Settings.MAX_BYTES, 1024)
+        widget.onRefine()
+        Settings.set(Settings.MAX_BYTES, 0)
+        self.assertIn("Red:", widget.statusLabel.text)
 
     def test_Settings(self):
         self.delayDisplay("Display units follow the store when enabled")
