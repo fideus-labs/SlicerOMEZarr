@@ -54,8 +54,8 @@ LENGTH_UNIT_TO_MM = {
     "yard": 914.4,
 }
 
-# Units the display can be switched to (coefficient from mm, suffix).
-DISPLAY_UNITS = {"micrometer": (1000.0, "µm"), "micron": (1000.0, "µm"), "nanometer": (1e6, "nm")}
+# Symbols shown in the panel, and used when the display follows the store's unit.
+UNIT_SYMBOLS = {"micrometer": "µm", "micron": "µm", "nanometer": "nm", "millimeter": "mm", "centimeter": "cm"}
 
 DEFAULT_BUDGET_FRACTION = 0.25  # of available RAM when the budget setting is "auto"
 FALLBACK_MAX_BYTES = 1 << 30
@@ -240,6 +240,44 @@ def labelGroupNames(root):
     return [str(n) for n in names] if isinstance(names, list) else []
 
 
+def scalarVolumes(nodes):
+    return [n for n in nodes if n.IsA("vtkMRMLScalarVolumeNode") and not n.IsA("vtkMRMLLabelMapVolumeNode")]
+
+
+def labelMaps(nodes):
+    return [n for n in nodes if n.IsA("vtkMRMLLabelMapVolumeNode")]
+
+
+def runResponsive(work, onTick=None):
+    """Run ``work()`` in a worker thread while this (GUI) thread keeps processing Qt events.
+
+    ``onTick`` is called from the GUI thread about a hundred times a second. An exception
+    raised by ``work`` is re-raised here; its return value is returned.
+    """
+    import threading
+    import time
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = work()
+        except BaseException as e:  # noqa: BLE001 - re-raised in the calling thread
+            outcome["error"] = e
+
+    thread = threading.Thread(target=target, name="OMEZarr", daemon=True)
+    thread.start()
+    while thread.is_alive():
+        slicer.app.processEvents()
+        if onTick:
+            onTick()
+        time.sleep(0.01)
+    thread.join()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result")
+
+
 #
 # Progress reporting
 #
@@ -266,7 +304,6 @@ class Progress:
         self.dialog.value = int(100 * done / max(1, total))
         if text:
             self.dialog.labelText = text
-        slicer.app.processEvents()
         return not self.dialog.wasCanceled
 
     def __exit__(self, *args):
@@ -485,53 +522,58 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         ijkToPhysical[:3, 3] = origin
         return toRas @ ijkToPhysical, source
 
+    @classmethod
+    def regionIjkToRas(cls, image, region=None, userMessages=None):
+        """IJK->RAS of ``region`` within the image (of the whole image without a region), and its source."""
+        ijkToRas, source = cls.ijkToRasMatrix(image, userMessages)
+        if region:
+            start = np.array([region.get(d, (0, None))[0] for d in SPATIAL_DIMS], dtype=float)
+            ijkToRas[:3, 3] = (ijkToRas @ np.append(start, 1.0))[:3]
+        return ijkToRas, source
+
     # ---- array access ----
 
     @staticmethod
-    def computeArray(darray, progress=None, label="", output=None):
-        """Compute a dask array slab by slab along its first axis, reporting progress.
+    def computeArray(darray, output, progress=None, label=""):
+        """Compute a dask array into ``output`` without freezing the application.
 
-        Slabs are groups of chunks of about 64 MiB, at most 32 of them, so small volumes
-        are one parallel compute and large ones report progress. ``output`` is an optional
-        preallocated array (for example a view on a vtkImageData buffer), so a volume is
-        never held twice in memory. Raises InterruptedError when cancelled.
+        The array is read slab by slab along its first axis (groups of chunks of about
+        64 MiB, at most 32), each slab a parallel dask compute, in a worker thread.
+        ``output`` is preallocated, typically a view on a vtkImageData buffer, so a volume is
+        never held twice in memory. Cancelling stops after the slab being read and raises
+        InterruptedError.
         """
-        if not hasattr(darray, "compute"):
-            result = np.asarray(darray)
-            if output is not None:
-                output[...] = result
-                return output
-            return result
         chunks = list(darray.chunks[0])
         steps = max(1, min(32, int(np.ceil(darray.nbytes / (64 << 20)))))
         groupSize = max(1, int(np.ceil(len(chunks) / steps)))
-        if output is None:
-            output = np.empty(darray.shape, dtype=darray.dtype)
-        start = 0
         total = int(np.ceil(len(chunks) / groupSize))
-        for step in range(total):
-            size = sum(chunks[step * groupSize : (step + 1) * groupSize])
-            output[start : start + size] = darray[start : start + size].compute()
-            start += size
-            if progress and not progress(step + 1, total, label):
-                raise InterruptedError("Loading cancelled")
-        return output
+        state = {"done": 0, "cancel": False}
 
-    @classmethod
-    def spatialArray(cls, image, timeIndex=0, channelIndex=0, region=None, userMessages=None, progress=None, label=""):
-        """Read one (z, y, x) volume as numpy. Only chunks intersecting ``region`` are read.
+        def work():
+            start = 0
+            for step in range(total):
+                if state["cancel"]:
+                    return
+                size = sum(chunks[step * groupSize : (step + 1) * groupSize])
+                output[start : start + size] = darray[start : start + size].compute()
+                start += size
+                state["done"] = step + 1
 
-        ``region`` maps spatial dim -> (start, stop) in this level's index space.
-        """
-        sub, addZ = cls.spatialDaskArray(image, timeIndex, channelIndex, region, userMessages)
-        array = cls.computeArray(sub, progress, label)
-        if addZ:
-            array = array[np.newaxis, ...]
-        return cls.toVtkCompatibleDtype(array)
+        def onTick():
+            if progress and not progress(state["done"], total, label):
+                state["cancel"] = True
+
+        runResponsive(work, onTick)
+        if state["cancel"]:
+            raise InterruptedError("Loading cancelled")
 
     @classmethod
     def spatialDaskArray(cls, image, timeIndex=0, channelIndex=0, region=None, userMessages=None):
-        """The lazy (z, y, x) sub-array of one time point and channel, and whether a z axis must be added."""
+        """The lazy (z, y, x) sub-array of one time point and channel, and whether a z axis must be added.
+
+        ``region`` maps spatial dim -> (start, stop) in this level's index space; only the
+        chunks it intersects are read when the array is computed.
+        """
         dims = list(image.dims)
         index = []
         for d in dims:
@@ -556,14 +598,6 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         return sub, "z" not in remaining
 
     @staticmethod
-    def toVtkCompatibleDtype(array):
-        if array.dtype == np.bool_:
-            return array.astype(np.uint8)
-        if array.dtype == np.float16:
-            return array.astype(np.float32)
-        return array
-
-    @staticmethod
     def vtkCompatibleDtype(dtype):
         dtype = np.dtype(dtype)
         if dtype == np.bool_:
@@ -573,29 +607,27 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         return dtype
 
     @classmethod
-    def fillVolumeNode(cls, node, image, timeIndex, channelIndex, region, ijkToRas, userMessages, progress, label):
-        """Read a (z, y, x) volume straight into the node's image buffer, one slab at a time.
+    def fillVolumeNode(
+        cls, node, image, timeIndex, channelIndex, region, ijkToRas, userMessages, progress, label, dtype=None
+    ):
+        """Read a (z, y, x) volume straight into the node's image buffer.
 
         The vtkImageData is allocated first and the dask array is computed into a numpy
-        view of its scalars, so peak memory is one copy of the volume, not two.
+        view of its scalars, so peak memory is one copy of the volume, not two. ``dtype``
+        overrides the stored type (label maps must be integer).
         """
         from vtk.util import numpy_support
 
         sub, addZ = cls.spatialDaskArray(image, timeIndex, channelIndex, region, userMessages)
         shape = (1, *sub.shape) if addZ else tuple(sub.shape)
-        dtype = cls.vtkCompatibleDtype(sub.dtype)
+        dtype = np.dtype(dtype) if dtype else cls.vtkCompatibleDtype(sub.dtype)
         imageData = vtk.vtkImageData()
         imageData.SetDimensions(int(shape[2]), int(shape[1]), int(shape[0]))
         imageData.AllocateScalars(numpy_support.get_vtk_array_type(dtype), 1)
         view = numpy_support.vtk_to_numpy(imageData.GetPointData().GetScalars()).reshape(shape)
-        target = view[0] if addZ else view
-        if dtype == sub.dtype:
-            cls.computeArray(sub, progress, label, output=target)
-        else:
-            target[...] = cls.computeArray(sub, progress, label).astype(dtype, copy=False)
+        cls.computeArray(sub.astype(dtype), view[0] if addZ else view, progress, label)
         node.SetAndObserveImageData(imageData)
         node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
-        node.Modified()
         return node
 
     # ---- channels and display ----
@@ -778,11 +810,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 vtk.vtkCommand.MessageEvent, f"Time axis has {timePoints} points; loaded index {timeIndex}."
             )
 
-        ijkToRas, orientationSource = cls.ijkToRasMatrix(image, userMessages)
-        if region:
-            start = np.array([region.get(d, (0, None))[0] for d in SPATIAL_DIMS], dtype=float)
-            ijkToRas = ijkToRas.copy()
-            ijkToRas[:3, 3] = (ijkToRas @ np.append(start, 1.0))[:3]
+        ijkToRas, orientationSource = cls.regionIjkToRas(image, region, userMessages)
 
         baseName = name or cls.defaultNodeName(path)
         lengthUnit = cls.lengthUnit(image)
@@ -944,19 +972,12 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             level = cls.selectLevel(multiscales, maxBytes or cls.maxBytesFromSettings())
         image = multiscales.images[int(level)]
         dims = list(image.dims)
-        ijkToRas, orientationSource = cls.ijkToRasMatrix(image, userMessages)
-        if region:
-            start = np.array([region.get(d, (0, None))[0] for d in SPATIAL_DIMS], dtype=float)
-            ijkToRas = ijkToRas.copy()
-            ijkToRas[:3, 3] = (ijkToRas @ np.append(start, 1.0))[:3]
+        ijkToRas, orientationSource = cls.regionIjkToRas(image, region, userMessages)
         nodeName = slicer.mrmlScene.GenerateUniqueName((name or cls.defaultNodeName(path)) + ("_ROI" if region else ""))
         node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", nodeName)
-        if np.issubdtype(np.dtype(image.data.dtype), np.integer) or image.data.dtype == np.bool_:
-            cls.fillVolumeNode(node, image, 0, 0, region, ijkToRas, userMessages, progress, nodeName)
-        else:
-            array = cls.spatialArray(image, 0, 0, region, userMessages, progress, nodeName).astype(np.int32)
-            slicer.util.updateVolumeFromArray(node, array)
-            node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
+        stored = np.dtype(image.data.dtype)
+        dtype = None if np.issubdtype(stored, np.integer) or stored == np.bool_ else np.int32
+        cls.fillVolumeNode(node, image, 0, 0, region, ijkToRas, userMessages, progress, nodeName, dtype)
         cls.setNodeAttributes(node, path, int(level), dims, 0, 0, cls.lengthUnit(image), orientationSource, region)
         node.CreateDefaultDisplayNodes()
         attrs = (multiscales.root_attributes or {}).get("image-label") if multiscales.root_attributes else None
@@ -1246,14 +1267,14 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     @staticmethod
     def applyDisplayUnits(lengthUnit):
         """Switch Slicer's length display to the store's unit when the setting is on."""
-        if not Settings.get(Settings.DISPLAY_UNITS, False) or lengthUnit not in DISPLAY_UNITS:
+        symbol = UNIT_SYMBOLS.get(lengthUnit)
+        if not Settings.get(Settings.DISPLAY_UNITS, False) or symbol in (None, "mm"):
             return
-        coefficient, suffix = DISPLAY_UNITS[lengthUnit]
         unitNode = slicer.mrmlScene.GetNodeByID("vtkMRMLUnitNodeApplicationLength")
         if unitNode is None:
             return
-        unitNode.SetDisplayCoefficient(coefficient)
-        unitNode.SetSuffix(suffix)
+        unitNode.SetDisplayCoefficient(1.0 / LENGTH_UNIT_TO_MM[lengthUnit])
+        unitNode.SetSuffix(symbol)
         unitNode.SetPrecision(2)
 
     @staticmethod
@@ -1336,14 +1357,19 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         isLabel = node.IsA("vtkMRMLLabelMapVolumeNode")
         image = cls.ngffImageFromVolumeNode(node)
         method = Methods.ITKWASM_LABEL_IMAGE if isLabel else None
-        try:
-            multiscales = ngff_zarr.to_multiscales(image, method=method)
-        except Exception:  # noqa: BLE001 - fall back to a single level rather than fail
-            logging.exception("Multiscale generation failed; writing a single level")
-            multiscales = ngff_zarr.to_multiscales(image, scale_factors=[])
+
+        def write():
+            try:
+                multiscales = ngff_zarr.to_multiscales(image, method=method)
+            except Exception:  # noqa: BLE001 - fall back to a single level rather than fail
+                logging.exception("Multiscale generation failed; writing a single level")
+                multiscales = ngff_zarr.to_multiscales(image, scale_factors=[])
+            ngff_zarr.to_ome_zarr(storePath, multiscales, overwrite=True)
+            return multiscales
+
         if progress:
             progress(0, 1, f"Writing {os.path.basename(storePath)}")
-        ngff_zarr.to_ome_zarr(storePath, multiscales, overwrite=True)
+        multiscales = runResponsive(write)
         version = str(getattr(multiscales.metadata, "version", "0.5") or "0.5")
         if isLabel:
             cls.addImageLabelMetadata(storePath, cls.imageLabelFromNode(node, version))
@@ -1428,6 +1454,7 @@ class AutoRefiner:
         self.maxBytes = maxBytes
         self.lastBounds = {}
         self.busy = False
+        self.pending = False
         self.refreshCount = 0
         self.timer = qt.QTimer()
         self.timer.setSingleShot(True)
@@ -1459,7 +1486,9 @@ class AutoRefiner:
         OMEZarrLogic.stopAutoRefine(self.path)
 
     def onSliceModified(self, caller=None, event=None):
-        if not self.busy:
+        if self.busy:
+            self.pending = True  # the application stays responsive while a block loads
+        else:
             self.timer.start()
 
     def viewBudget(self):
@@ -1489,6 +1518,9 @@ class AutoRefiner:
                     logging.exception(f"Auto-refine of {viewName} failed")
         finally:
             self.busy = False
+            if self.pending:
+                self.pending = False
+                self.timer.start()
 
 
 #
@@ -1555,8 +1587,8 @@ class OMEZarrFileReader:
             return False
 
         if properties.get("show", True) and nodes:
-            scalars = [n for n in nodes if n.IsA("vtkMRMLScalarVolumeNode") and not n.IsA("vtkMRMLLabelMapVolumeNode")]
-            labels = [n for n in nodes if n.IsA("vtkMRMLLabelMapVolumeNode")]
+            scalars = scalarVolumes(nodes)
+            labels = labelMaps(nodes)
             slicer.util.setSliceViewerLayers(
                 background=scalars[0] if scalars else "keep-current",
                 label=labels[0] if labels else "keep-current",
@@ -1751,18 +1783,22 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
         self.roiSelector = slicer.qMRMLNodeComboBox()
         self.roiSelector.nodeTypes = ["vtkMRMLMarkupsROINode"]
-        self.roiSelector.addEnabled = True
+        self.roiSelector.addEnabled = False  # "New ROI in view" creates one that is already placed
         self.roiSelector.removeEnabled = True
+        self.roiSelector.renameEnabled = True
         self.roiSelector.noneEnabled = True
         self.roiSelector.setMRMLScene(slicer.mrmlScene)
-        self.loadRegionButton = qt.QPushButton(_("Load region"))
-        self.loadRegionButton.setToolTip(
-            _("Load the ROI at the selected level; only the chunks it intersects are read")
+        self.createRoiButton = qt.QPushButton(_("New ROI in view"))
+        self.createRoiButton.setToolTip(
+            _("Create a region of interest covering the middle of the selected slice view; drag its handles to adjust")
         )
         roiRow = qt.QHBoxLayout()
         roiRow.addWidget(self.roiSelector, 1)
-        roiRow.addWidget(self.loadRegionButton)
+        roiRow.addWidget(self.createRoiButton)
         refineLayout.addRow(_("Region of interest:"), roiRow)
+        self.loadRegionButton = qt.QPushButton(_("Load region at the selected level"))
+        self.loadRegionButton.setToolTip(_("Only the chunks the region intersects are read"))
+        refineLayout.addRow(self.loadRegionButton)
 
         self.statusLabel = qt.QLabel()
         self.statusLabel.wordWrap = True
@@ -1839,6 +1875,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.refineButton.connect("clicked(bool)", self.onRefine)
         self.autoRefineCheckBox.connect("toggled(bool)", self.onAutoRefineToggled)
         self.loadRegionButton.connect("clicked(bool)", self.onLoadRegion)
+        self.createRoiButton.connect("clicked(bool)", self.onCreateRoi)
         self.levelTable.connect("itemSelectionChanged()", self.updateButtons)
         self.levelTable.connect("cellDoubleClicked(int,int)", lambda row, column: self.onLoad())
         self.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", lambda node: self.updateButtons())
@@ -1895,11 +1932,6 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             )
             self.updateButtons()
 
-    def currentPath(self):
-        if not self.path:
-            self.onInspect()
-        return self.path
-
     def selectedLevel(self):
         rows = self.levelTable.selectionModel().selectedRows() if self.levelTable.rowCount else []
         return rows[0].row() if rows else -1
@@ -1908,6 +1940,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         hasStore = self.path is not None
         self.loadButton.setEnabled(hasStore and self.selectedLevel() >= 0)
         self.refineButton.setEnabled(hasStore)
+        self.createRoiButton.setEnabled(hasStore)
         self.autoRefineCheckBox.setEnabled(hasStore)
         self.loadRegionButton.setEnabled(hasStore and self.roiSelector.currentNode() is not None)
 
@@ -1924,29 +1957,23 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             return
         self._inspecting = True  # adding the path to the history re-emits currentPathChanged
         try:
-            self._inspect(path)
+            with slicer.util.tryWithErrorDisplay(_("Failed to open store"), waitCursor=True):
+                self.multiscales = self.logic.openMultiscales(path, useCache=False)
+                self.path = path
+                self.pathEdit.addCurrentPathToHistory()
+                self.showLevels()
         finally:
             self._inspecting = False
         self.updateButtons()
 
-    @staticmethod
-    def unitSymbol(unit):
-        return {"micrometer": "µm", "micron": "µm", "millimeter": "mm", "nanometer": "nm", "centimeter": "cm"}.get(
-            unit, unit or ""
-        )
-
-    def _inspect(self, path):
-        with slicer.util.tryWithErrorDisplay(_("Failed to open store"), waitCursor=True):
-            self.multiscales = self.logic.openMultiscales(path, useCache=False)
-            self.path = path
-            self.pathEdit.addCurrentPathToHistory()
-        if self.multiscales is None:
-            return
+    def showLevels(self):
+        """Fill the level table and the summary line from the open store."""
         info = self.logic.levelInfo(self.multiscales)
         self.levelTable.setRowCount(len(info))
         for row, level in enumerate(info):
             shape = dict(zip(level["dims"], level["shape"], strict=False))
-            unit = self.unitSymbol(next((level["units"].get(d) for d in SPATIAL_DIMS if level["units"].get(d)), None))
+            unit = next((level["units"].get(d) for d in SPATIAL_DIMS if level["units"].get(d)), None)
+            unit = UNIT_SYMBOLS.get(unit, unit or "")
             values = [
                 str(level["level"]),
                 " × ".join(str(shape[d]) for d in SPATIAL_DIMS if d in shape),
@@ -1969,7 +1996,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.timeIndexLabel.setVisible(timePoints > 1)
         self.timeIndexSpinBox.setVisible(timePoints > 1)
         _matrix, source = self.logic.ijkToRasMatrix(image)
-        labels = labelGroupNames(path)
+        labels = labelGroupNames(self.path)
         orientation = _("RFC-4 orientation") if source == "rfc4" else _("axes {0}").format(source.replace("-", " "))
         self.infoLabel.text = " · ".join(
             [
@@ -2016,7 +2043,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                     item.setToolTip(". ".join(notes))
 
     def onLoad(self):
-        if not self.currentPath() or self.selectedLevel() < 0:
+        if not self.path or self.selectedLevel() < 0:
             return
         properties = {"level": self.selectedLevel()}
         if self.timeIndexSpinBox.value >= 0:
@@ -2026,7 +2053,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.updateLevelStatus()
 
     def describeNodes(self, prefix, nodes):
-        volumes = [n for n in nodes if n.IsA("vtkMRMLScalarVolumeNode") and not n.IsA("vtkMRMLLabelMapVolumeNode")]
+        volumes = scalarVolumes(nodes)
         if not volumes:
             return prefix
         dims = volumes[0].GetImageData().GetDimensions()
@@ -2041,7 +2068,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         )
 
     def onRefine(self):
-        if not self.currentPath():
+        if not self.path:
             return
         view = self.viewSelector.currentText
         try:
@@ -2063,7 +2090,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             if self.path:
                 OMEZarrLogic.stopAutoRefine(self.path)
             return
-        if not self.currentPath():
+        if not self.path:
             self.autoRefineCheckBox.checked = False
             return
         with slicer.util.tryWithErrorDisplay(_("Failed to start automatic refinement")):
@@ -2072,9 +2099,29 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
     def cleanup(self):
         OMEZarrLogic.stopAutoRefine()
 
+    def onCreateRoi(self):
+        """A region of interest already placed: the middle half of what the slice view shows."""
+        view = self.viewSelector.currentText
+        bounds = self.logic.sliceViewRasBounds(view)
+        center = [(bounds[i] + bounds[i + 1]) / 2.0 for i in (0, 2, 4)]
+        size = [(bounds[i + 1] - bounds[i]) / 2.0 for i in (0, 2, 4)]
+        roiNode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLMarkupsROINode", slicer.mrmlScene.GenerateUniqueName("OME-Zarr region")
+        )
+        roiNode.CreateDefaultDisplayNodes()
+        roiNode.SetCenter(*center)
+        roiNode.SetSize(*size)
+        roiNode.GetDisplayNode().SetHandlesInteractive(True)
+        self.roiSelector.setCurrentNode(roiNode)
+        self.statusLabel.text = _(
+            "Drag the handles of the region in the slice views to adjust it, select a level above, "
+            "then click 'Load region at the selected level'."
+        )
+        self.updateButtons()
+
     def onLoadRegion(self):
         roiNode = self.roiSelector.currentNode()
-        if roiNode is None or not self.currentPath():
+        if roiNode is None or not self.path:
             return
         try:
             with Progress(_("Loading region...")) as progress:
@@ -2091,7 +2138,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         except ValueError as e:
             self.statusLabel.text = _("Region: {error}").format(error=e)
             return
-        scalars = [n for n in nodes if n.IsA("vtkMRMLScalarVolumeNode") and not n.IsA("vtkMRMLLabelMapVolumeNode")]
+        scalars = scalarVolumes(nodes)
         if scalars:
             slicer.util.setSliceViewerLayers(background=scalars[0], fit=True)
         self.statusLabel.text = self.describeNodes(roiNode.GetName(), nodes)
@@ -2159,6 +2206,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_StorageOptions()
             self.test_SegmentationWriter()
             self.test_WidgetInspectsByItself()
+            self.test_ReadsKeepTheApplicationResponsive()
             self.test_Settings()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
@@ -2293,6 +2341,37 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         OMEZarrLogic.clearCache()
         return data, storePath
 
+    def writeLabelGroup(self, storePath, name, shape):
+        """Add a two-label ``labels/<name>`` group, with image-label metadata, to a microscopy store."""
+        import ngff_zarr
+
+        labelData = np.zeros(shape, dtype=np.uint16)
+        labelData[2:6, 5:15, 10:20] = 1
+        labelData[6:10, 15:25, 20:35] = 3
+        labelImage = ngff_zarr.to_ngff_image(
+            labelData,
+            dims=("z", "y", "x"),
+            scale={"z": 2.0, "y": 0.25, "x": 0.25},
+            translation={"z": 10.0, "y": -5.0, "x": 3.0},
+            axes_units={"z": "micrometer", "y": "micrometer", "x": "micrometer"},
+        )
+        labelPath = os.path.join(storePath, "labels", name)
+        ngff_zarr.to_ome_zarr(
+            labelPath,
+            ngff_zarr.to_multiscales(labelImage, scale_factors=[2], method=ngff_zarr.Methods.ITKWASM_LABEL_IMAGE),
+        )
+        OMEZarrLogic.addImageLabelMetadata(
+            labelPath,
+            {
+                "version": "0.5",
+                "colors": [{"label-value": 1, "rgba": [255, 0, 0, 255]}, {"label-value": 3, "rgba": [0, 0, 255, 128]}],
+                "properties": [{"label-value": 1, "name": "nucleus"}, {"label-value": 3, "name": "cytoplasm"}],
+            },
+        )
+        OMEZarrLogic.registerLabelInParent(labelPath)
+        OMEZarrLogic.clearCache()
+        return labelData, labelPath
+
     def test_MicroscopyAxes(self):
         self.delayDisplay("c,z,y,x microscopy store in micrometres, two channels")
         data, storePath = self.writeMicroscopyStore()
@@ -2318,39 +2397,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
 
     def test_Labels(self):
         self.delayDisplay("Labels group loads as a label map with its colour table")
-        import ngff_zarr
-
         data, storePath = self.writeMicroscopyStore("labelled")
-        labelData = np.zeros(data.shape[1:], dtype=np.uint16)
-        labelData[2:6, 5:15, 10:20] = 1
-        labelData[6:10, 15:25, 20:35] = 3
-        labelImage = ngff_zarr.to_ngff_image(
-            labelData,
-            dims=("z", "y", "x"),
-            scale={"z": 2.0, "y": 0.25, "x": 0.25},
-            translation={"z": 10.0, "y": -5.0, "x": 3.0},
-            axes_units={"z": "micrometer", "y": "micrometer", "x": "micrometer"},
-        )
-        labelPath = os.path.join(storePath, "labels", "nuclei")
-        ngff_zarr.to_ome_zarr(
-            labelPath,
-            ngff_zarr.to_multiscales(labelImage, scale_factors=[2], method=ngff_zarr.Methods.ITKWASM_LABEL_IMAGE),
-        )
-        OMEZarrLogic.addImageLabelMetadata(
-            labelPath,
-            {
-                "version": "0.5",
-                "colors": [{"label-value": 1, "rgba": [255, 0, 0, 255]}, {"label-value": 3, "rgba": [0, 0, 255, 128]}],
-                "properties": [{"label-value": 1, "name": "nucleus"}, {"label-value": 3, "name": "cytoplasm"}],
-            },
-        )
-        OMEZarrLogic.registerLabelInParent(labelPath)
+        labelData, labelPath = self.writeLabelGroup(storePath, "nuclei", data.shape[1:])
         self.assertEqual(labelGroupNames(storePath), ["nuclei"])
         self.assertTrue(isLabelStore(labelPath))
-        OMEZarrLogic.clearCache()
 
         nodes = OMEZarrLogic.loadImage(storePath, level=0)
-        labelNodes = [n for n in nodes if n.IsA("vtkMRMLLabelMapVolumeNode")]
+        labelNodes = labelMaps(nodes)
         self.assertEqual(len(nodes), 3)
         self.assertEqual(len(labelNodes), 1)
         labelNode = labelNodes[0]
@@ -2584,31 +2637,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
 
     def test_LabelsAsSegmentation(self):
         self.delayDisplay("Labels load as a Segmentation when the setting is on")
-        import ngff_zarr
-
         data, storePath = self.writeMicroscopyStore("segmented")
-        labelData = np.zeros(data.shape[1:], dtype=np.uint16)
-        labelData[2:6, 5:15, 10:20] = 1
-        labelData[6:10, 15:25, 20:35] = 3
-        labelImage = ngff_zarr.to_ngff_image(
-            labelData,
-            dims=("z", "y", "x"),
-            scale={"z": 2.0, "y": 0.25, "x": 0.25},
-            translation={"z": 10.0, "y": -5.0, "x": 3.0},
-            axes_units={"z": "micrometer", "y": "micrometer", "x": "micrometer"},
-        )
-        labelPath = os.path.join(storePath, "labels", "cells")
-        ngff_zarr.to_ome_zarr(labelPath, ngff_zarr.to_multiscales(labelImage, scale_factors=[2]))
-        OMEZarrLogic.addImageLabelMetadata(
-            labelPath,
-            {
-                "version": "0.5",
-                "colors": [{"label-value": 1, "rgba": [255, 0, 0, 255]}, {"label-value": 3, "rgba": [0, 0, 255, 255]}],
-                "properties": [{"label-value": 1, "name": "nucleus"}, {"label-value": 3, "name": "cytoplasm"}],
-            },
-        )
-        OMEZarrLogic.registerLabelInParent(labelPath)
-        OMEZarrLogic.clearCache()
+        _labelData, labelPath = self.writeLabelGroup(storePath, "cells", data.shape[1:])
         Settings.set(Settings.LABELS_AS_SEGMENTATION, True)
         labelMapsBefore = len(slicer.util.getNodesByClass("vtkMRMLLabelMapVolumeNode"))
         nodes = OMEZarrLogic.loadImage(storePath, level=0, channels=[0])
@@ -2784,12 +2814,41 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertTrue(samePath(widget.pathEdit.currentPath, storePath))
         self.assertEqual(widget.levelTable.rowCount, 3)
         self.assertEqual(widget.levelTable.item(2, 0).text(), "2 ✓")
+        # A region of interest is created already placed, then loaded.
+        slicer.app.layoutManager().sliceWidget("Red").mrmlSliceNode().SetFieldOfView(60.0, 60.0, 1.0)
+        widget.onCreateRoi()
+        roiNode = widget.roiSelector.currentNode()
+        self.assertIsNotNone(roiNode)
+        self.assertTrue(widget.loadRegionButton.enabled)
+        self.assertGreater(min(roiNode.GetSize()), 0.0)
+
+        def regionNodes():
+            nodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            return [n for n in nodes if n.GetAttribute("OMEZarr.Region") and not n.GetAttribute("OMEZarr.Refined")]
+
+        widget.levelTable.selectRow(0)
+        regionsBefore = len(regionNodes())
+        widget.onLoadRegion()
+        self.assertEqual(len(regionNodes()), regionsBefore + 1)
         # A refusal is reported in the panel, not in a popup.
         widget.viewSelector.setCurrentText("Red")
         Settings.set(Settings.MAX_BYTES, 1024)
         widget.onRefine()
         Settings.set(Settings.MAX_BYTES, 0)
         self.assertIn("Red:", widget.statusLabel.text)
+
+    def test_ReadsKeepTheApplicationResponsive(self):
+        self.delayDisplay("Qt events are processed while a volume is read")
+        mrHead, storePath = self.writeMRHeadStore()
+        ticks = []
+        timer = qt.QTimer()
+        timer.setInterval(1)
+        timer.timeout.connect(lambda: ticks.append(1))
+        timer.start()
+        node = OMEZarrLogic.loadImage(storePath, level=0)[0]
+        timer.stop()
+        self.assertGreater(len(ticks), 0)
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), slicer.util.arrayFromVolume(mrHead))
 
     def test_Settings(self):
         self.delayDisplay("Display units follow the store when enabled")
