@@ -29,12 +29,12 @@ With this extension, in Slicer:
 * **Results other tools can read.** Volumes, label maps and segmentations are
   saved as multiscale OME-Zarr, with orientation, label names and colours.
 
-![Walkthrough: refine the slice views of a public S3 store, then render it in 3D](Screenshots/walkthrough.gif)
+![Walkthrough: open a public S3 store, refine the 2D views, load a region of interest, render in 3D](Screenshots/walkthrough.gif)
 
 Recorded on a public CT scan of a chameleon from the
 [OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets),
 read from S3 (2.1 GiB at 0.09 mm). Full video with captions:
-[SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4) (1 min 34).
+[SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4) (1 min 30).
 Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
 
 ## Usage
@@ -63,12 +63,13 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
 * **Multiscales**: the finest level whose volumes fit the memory budget is
   loaded. The budget defaults to a quarter of the free RAM and can be fixed in
   the module settings. A message says which level was chosen.
-* **Refine current view**: reloads the block shown by a slice view at the
+* **Refine view**: reloads the block shown by a slice view at the
   finest level that fits the budget, reading only the chunks it needs, and
   overlays it on the coarse volume in that view with the same window/level.
   Each slice view keeps its own block, and refinement can run automatically
-  in all three views each time a view stops moving. Region-of-interest
-  loading does the same for a Markups ROI. Time series are refined at the
+  in all three views each time a view stops moving. "New ROI in view" places a
+  region of interest on a view, and loading it gives an ordinary volume at the
+  level you pick. Time series are refined at the
   time point selected in the sequence browser.
 * **Labels**: the `labels` groups of a store load as label map volumes with
   the colours and names of their `image-label` metadata, or as Segmentation
