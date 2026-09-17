@@ -112,7 +112,6 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   store, and `slicer.util.saveNode` ignores a requested file type. Both need
   changes in Slicer core (tracked in issue #1); use drag-and-drop, the
   `zarr.json` file, or the save dialog meanwhile.
-* Submission to the Extensions Index once the repository is public.
 
 ## Development
 
