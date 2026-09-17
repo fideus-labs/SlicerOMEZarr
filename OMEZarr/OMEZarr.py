@@ -1716,7 +1716,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         storeBox = ctk.ctkCollapsibleButton()
         storeBox.text = _("Store")
         self.layout.addWidget(storeBox)
-        storeLayout = qt.QFormLayout(storeBox)
+        storeLayout = qt.QVBoxLayout(storeBox)  # a form layout mis-measures word-wrapped labels
 
         self.pathEdit = ctk.ctkPathLineEdit()
         self.pathEdit.filters = ctk.ctkPathLineEdit.Dirs
@@ -1728,14 +1728,14 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         pathRow = qt.QHBoxLayout()
         pathRow.addWidget(self.pathEdit, 1)
         pathRow.addWidget(self.inspectButton)
-        storeLayout.addRow(pathRow)
+        storeLayout.addLayout(pathRow)
 
         self.infoLabel = qt.QLabel(
             _("Choose an OME-Zarr store, or drop one onto Slicer: its resolution levels are listed here.")
         )
         self.infoLabel.wordWrap = True
         self.infoLabel.setTextInteractionFlags(qt.Qt.TextSelectableByMouse)
-        storeLayout.addRow(self.infoLabel)
+        storeLayout.addWidget(self.infoLabel)
 
         self.levelTable = qt.QTableWidget(0, 4)
         self.levelTable.setHorizontalHeaderLabels([_("Level"), _("Voxels (x, y, z)"), _("Spacing"), _("Memory")])
@@ -1751,27 +1751,32 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         header.setSectionResizeMode(qt.QHeaderView.Stretch)
         for column in (0, 1, 3):
             header.setSectionResizeMode(column, qt.QHeaderView.ResizeToContents)
-        storeLayout.addRow(self.levelTable)
+        storeLayout.addWidget(self.levelTable)
 
         self.legendLabel = qt.QLabel(_("Bold: the level the memory budget selects. ✓: loaded in the scene."))
         self.legendLabel.wordWrap = True
         self.legendLabel.enabled = False  # greyed like a hint, in any Slicer style
-        storeLayout.addRow(self.legendLabel)
+        storeLayout.addWidget(self.legendLabel)
 
         self.timeIndexLabel = qt.QLabel(_("Time point:"))
         self.timeIndexSpinBox = qt.QSpinBox()
         self.timeIndexSpinBox.setRange(0, 0)
         self.timeIndexSpinBox.setSpecialValueText(_("all (sequence)"))
-        storeLayout.addRow(self.timeIndexLabel, self.timeIndexSpinBox)
+        timeRow = qt.QHBoxLayout()
+        timeRow.addWidget(self.timeIndexLabel)
+        timeRow.addWidget(self.timeIndexSpinBox, 1)
+        storeLayout.addLayout(timeRow)
 
         self.loadButton = qt.QPushButton(_("Load selected level"))
-        storeLayout.addRow(self.loadButton)
+        storeLayout.addWidget(self.loadButton)
 
         # -- Full resolution --
         refineBox = ctk.ctkCollapsibleButton()
         refineBox.text = _("Full resolution")
         self.layout.addWidget(refineBox)
-        refineLayout = qt.QFormLayout(refineBox)
+        refineBoxLayout = qt.QVBoxLayout(refineBox)
+        refineLayout = qt.QFormLayout()
+        refineBoxLayout.addLayout(refineLayout)
 
         self.viewSelector = qt.QComboBox()
         self.viewSelector.setToolTip(_("The 2D view that 'Refine view' and 'New ROI in view' act on"))
@@ -1810,7 +1815,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
         self.statusLabel = qt.QLabel()
         self.statusLabel.wordWrap = True
-        refineLayout.addRow(self.statusLabel)
+        refineBoxLayout.addWidget(self.statusLabel)
 
         # -- Settings --
         settingsBox = ctk.ctkCollapsibleButton()
@@ -1910,7 +1915,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
     def updateViewSelector(self):
         """List the slice views of the current layout as "Red (Axial)", keeping the selection."""
         layoutManager = slicer.app.layoutManager()
-        current = self.viewSelector.currentData
+        current = self.viewSelector.currentData or "Red"
         self.viewSelector.clear()
         for name in layoutManager.sliceViewNames():
             orientation = layoutManager.sliceWidget(name).mrmlSliceNode().GetOrientation()
@@ -1996,7 +2001,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             values = [
                 str(level["level"]),
                 " × ".join(str(shape[d]) for d in SPATIAL_DIMS if d in shape),
-                (" × ".join(f"{level['scale'][d]:g}" for d in SPATIAL_DIMS if d in shape) + f" {unit}").strip(),
+                (" × ".join(f"{level['scale'][d]:.4g}" for d in SPATIAL_DIMS if d in shape) + f" {unit}").strip(),
                 self.formatBytes(level["bytes"]),
             ]
             for column, value in enumerate(values):
@@ -2131,6 +2136,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         roiNode.SetCenter(*center)
         roiNode.SetSize(*size)
         roiNode.GetDisplayNode().SetHandlesInteractive(True)
+        roiNode.GetDisplayNode().SetFillOpacity(0.1)
         self.roiSelector.setCurrentNode(roiNode)
         self.statusLabel.text = _(
             "Drag the handles of the region in the slice views to adjust it, select a level above, "

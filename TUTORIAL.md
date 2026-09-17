@@ -1,6 +1,6 @@
 # Walkthrough
 
-Video with captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4).
+Video with captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4) (1 min 30).
 
 Recorded on a public store of the
 [OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets),
@@ -8,58 +8,68 @@ read straight from `s3://ome-zarr-scivis/v0.5/96x2/chameleon.ome.zarr`: a CT
 scan of a chameleon (*Chamaeleo calyptratus*, Digital Morphology, 2003),
 OME-Zarr 0.5, 1024 × 1024 × 1080 voxels of 0.092 × 0.092 × 0.105 mm, uint16,
 four levels of 2160, 270, 33.8 and 4.2 MiB. The memory budget was set to
-128 MiB so that a coarse level loads first. A local `.ome.zarr` directory
-works the same way.
+128 MiB so that a coarse level loads first. A local `.ome.zarr` folder works
+the same way.
 
-1. **Install** the extension. The OME-Zarr module appears under Informatics;
+1. **Install** the extension and open the OME-Zarr module (Informatics).
    `ngff-zarr` is installed into Slicer's Python on first use.
 
    ![OME-Zarr module](Screenshots/tutorial/01-start.jpg)
 
-2. **Open a store.** Paste an `https://` or `s3://` address in the Store field
-   and click Inspect. Public S3 buckets are read anonymously when no AWS
-   credentials are set. A local store can be chosen in the same field, dropped
-   onto the Slicer window ("Load OME-Zarr image"), or added with
-   `File → Add Data` through its `zarr.json` or `.zattrs`. Inspect lists the
-   levels with their shape, chunks, size and spacing, and preselects the finest
-   level that fits the memory budget.
+2. **Open a store.** Paste an `https://` or `s3://` address in the Store
+   field, or choose a local folder. The levels are listed right away, with
+   their voxels, spacing and memory. The level in bold is the one the memory
+   budget selects. Public S3 buckets are read anonymously when no AWS
+   credentials are set. You can also drop a local store onto the Slicer window
+   ("Load OME-Zarr image"), or use `File → Add Data` with its `zarr.json` or
+   `.zattrs`.
 
-   ![Inspect](Screenshots/tutorial/02-inspect.jpg)
+   ![Levels of the store](Screenshots/tutorial/02-levels.jpg)
 
-3. **Overview.** Load level reads level 2 (33.8 MiB) in a few seconds.
-   Spacing and origin come from the store, in mm. Without RFC-4 orientation the
-   axes are taken as LPS (or RAS, in the settings). The window was set to
-   2000 to 50000 to show bone.
+3. **Load a level.** "Load selected level" reads level 2 (33.8 MiB) in a few
+   seconds; Slicer stays responsive while it reads. Spacing and origin come
+   from the store, in mm. Loaded levels get a ✓ in the table. Without RFC-4
+   orientation the axes are taken as LPS (or RAS, in the settings). The window
+   was set to 2000 to 50000 to show bone.
 
    ![Coarse level loaded](Screenshots/tutorial/03-loaded.jpg)
 
-4. **Refine.** Zoom a slice view and click "Refine current view": the block
-   the view shows is reloaded at the finest level that fits the budget,
-   reading only the chunks it needs, and overlaid with the coarse volume's
-   window/level. Here the skull in a 30 mm view comes back at level 0,
-   326 × 228 × 102 voxels, 14.5 MiB. If nothing finer than the displayed
-   level fits, refinement is refused: zoom in or raise the budget.
+4. **Refine a view.** Zoom a 2D view on what you care about, here the skull,
+   pick that view in "2D view" and click "Refine view". The block the view
+   shows is read again at the finest level that fits the budget, only the
+   chunks it needs, and laid over the coarse volume with the same contrast.
+   The panel reports what was loaded (here level 0, about 29 MiB). If nothing
+   finer than what is displayed fits, the panel tells you to zoom in.
 
    ![Refined view](Screenshots/tutorial/04-refined.jpg)
 
-5. **Browse.** Tick "Refine automatically": each slice view keeps its own
-   block and reloads it once the view stops moving. The budget is shared
-   between the three views.
+5. **Browse.** Tick "Refine the slice views automatically while browsing":
+   each 2D view keeps its own block and reloads it when the view stops moving.
+   Nothing loads while you pan or zoom, and the budget is shared between the
+   three views.
 
    ![Automatic refinement](Screenshots/tutorial/05-auto-refine.jpg)
 
-6. **Everything else** is ordinary Slicer: volume rendering, segmentation,
-   registration. Stores with `labels/` groups load as label maps or
+6. **Load a region to work on.** Click "New ROI in view": a region of interest
+   appears in the middle of the selected view. Drag its handles in the 2D
+   views, select a level in the table, and click "Load region at the selected
+   level". The result is an ordinary Slicer volume at that resolution, ready
+   to segment, register or save.
+
+   ![Region of interest](Screenshots/tutorial/06-region.jpg)
+
+7. **Everything else** is ordinary Slicer, for example volume rendering of the
+   loaded level. Stores with `labels/` groups load as label maps or
    Segmentations, time series as Sequences, and `File → Save` with the
    "OME-Zarr image" format writes volumes, label maps and segmentations back
    as multiscale stores.
 
-   ![Volume rendering](Screenshots/tutorial/06-volume-rendering.jpg)
+   ![Volume rendering](Screenshots/tutorial/07-volume-rendering.jpg)
 
-7. **Settings**: memory budget, assumed orientation, labels, time axis,
+8. **Settings**: memory budget, axes without RFC-4, labels, time axis,
    display units, label map detection, remote storage options, auto-refine.
 
-   ![Settings](Screenshots/tutorial/07-settings.jpg)
+   ![Settings](Screenshots/tutorial/08-settings.jpg)
 
 From Python:
 
