@@ -2,67 +2,71 @@
 
 Video with captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4).
 
-Recorded on an ExaSPIM mouse brain (`Volume.ome.zarr`, OME-Zarr 0.4,
-1775 × 1331 × 514 voxels at 30.08 × 30.08 × 40 µm, two levels: 2316 MiB and
-36 MiB, chunks 256³). The memory budget was set to 512 MiB so that the
-coarse level loads first.
+Recorded on a public store of the
+[OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets),
+read straight from `s3://ome-zarr-scivis/v0.5/96x2/chameleon.ome.zarr`: a CT
+scan of a chameleon (*Chamaeleo calyptratus*, Digital Morphology, 2003),
+OME-Zarr 0.5, 1024 × 1024 × 1080 voxels of 0.092 × 0.092 × 0.105 mm, uint16,
+four levels of 2160, 270, 33.8 and 4.2 MiB. The memory budget was set to
+128 MiB so that a coarse level loads first. A local `.ome.zarr` directory
+works the same way.
 
 1. **Install** the extension. The OME-Zarr module appears under Informatics;
    `ngff-zarr` is installed into Slicer's Python on first use.
 
-2. **Drop** the `.ome.zarr` directory onto the Slicer window and pick
-   "Load OME-Zarr image". `File → Add Data` also works with the store's
-   `zarr.json` or `.zattrs`.
+   ![OME-Zarr module](Screenshots/tutorial/01-start.jpg)
 
-   ![Reader chooser](Screenshots/tutorial/02-choose-reader.jpg)
+2. **Open a store.** Paste an `https://` or `s3://` address in the Store field
+   and click Inspect. Public S3 buckets are read anonymously when no AWS
+   credentials are set. A local store can be chosen in the same field, dropped
+   onto the Slicer window ("Load OME-Zarr image"), or added with
+   `File → Add Data` through its `zarr.json` or `.zattrs`. Inspect lists the
+   levels with their shape, chunks, size and spacing, and preselects the finest
+   level that fits the memory budget.
 
-3. **Overview.** The finest level that fits the budget loads, here level 1
-   in under a second. Spacing and origin come from the store, in mm. Without
-   RFC-4 orientation the axes are taken as LPS (or RAS, in the settings).
+   ![Inspect](Screenshots/tutorial/02-inspect.jpg)
+
+3. **Overview.** Load level reads level 2 (33.8 MiB) in a few seconds.
+   Spacing and origin come from the store, in mm. Without RFC-4 orientation the
+   axes are taken as LPS (or RAS, in the settings). The window was set to
+   2000 to 50000 to show bone.
 
    ![Coarse level loaded](Screenshots/tutorial/03-loaded.jpg)
 
-4. **Inspect** lists the levels, their shape, chunks, size and spacing.
-
-   ![Inspect](Screenshots/tutorial/04-inspect.jpg)
-
-5. **Refine.** Zoom a slice view and click "Refine current view": the block
+4. **Refine.** Zoom a slice view and click "Refine current view": the block
    the view shows is reloaded at the finest level that fits the budget,
    reading only the chunks it needs, and overlaid with the coarse volume's
-   window/level. If nothing finer than the displayed level fits, refinement
-   is refused: zoom in or raise the budget.
+   window/level. Here the skull in a 30 mm view comes back at level 0,
+   326 × 228 × 102 voxels, 14.5 MiB. If nothing finer than the displayed
+   level fits, refinement is refused: zoom in or raise the budget.
 
-   ![Refined view](Screenshots/tutorial/05-refined.jpg)
+   ![Refined view](Screenshots/tutorial/04-refined.jpg)
 
-6. **Browse.** Tick "Refine automatically": each slice view keeps its own
-   block and reloads it once the view stops moving.
+5. **Browse.** Tick "Refine automatically": each slice view keeps its own
+   block and reloads it once the view stops moving. The budget is shared
+   between the three views.
 
-   ![Automatic refinement](Screenshots/tutorial/06-auto-refine.jpg)
+   ![Automatic refinement](Screenshots/tutorial/05-auto-refine.jpg)
 
-7. **Masks and labels.** Dropping `Mask.ome.zarr`, a uint8 store with two
-   values and no `image-label` metadata, gives a label map. Stores with
-   `labels/` groups load with their colours and names, or as Segmentations.
+6. **Everything else** is ordinary Slicer: volume rendering, segmentation,
+   registration. Stores with `labels/` groups load as label maps or
+   Segmentations, time series as Sequences, and `File → Save` with the
+   "OME-Zarr image" format writes volumes, label maps and segmentations back
+   as multiscale stores.
 
-   ![Mask as label map](Screenshots/tutorial/07-mask.jpg)
+   ![Volume rendering](Screenshots/tutorial/06-volume-rendering.jpg)
 
-8. **Everything else** is ordinary Slicer: volume rendering, segmentation,
-   registration. `File → Save` with the "OME-Zarr image" format writes
-   volumes, label maps and segmentations back as multiscale stores. Remote
-   `https://` and `s3://` stores load the same way; public S3 buckets are
-   read anonymously.
-
-   ![Volume rendering](Screenshots/tutorial/08-volume-rendering.jpg)
-
-9. **Settings**: memory budget, assumed orientation, labels, time axis,
+7. **Settings**: memory budget, assumed orientation, labels, time axis,
    display units, label map detection, remote storage options, auto-refine.
 
-   ![Settings](Screenshots/tutorial/09-settings.jpg)
+   ![Settings](Screenshots/tutorial/07-settings.jpg)
 
 From Python:
 
 ```python
-slicer.util.loadNodeFromFile("/data/653153/Volume.ome.zarr", "OMEZarr", {"level": 1})
+url = "s3://ome-zarr-scivis/v0.5/96x2/chameleon.ome.zarr"
+slicer.util.loadNodeFromFile(url, "OMEZarr", {"level": 2})
 from OMEZarr import OMEZarrLogic
-OMEZarrLogic.refineView("/data/653153/Volume.ome.zarr", "Red")
-OMEZarrLogic.startAutoRefine("/data/653153/Volume.ome.zarr")
+OMEZarrLogic.refineView(url, "Red")
+OMEZarrLogic.startAutoRefine(url)
 ```

@@ -23,6 +23,7 @@ import qt
 import vtk
 
 import slicer
+import slicer.packaging
 from slicer.i18n import tr as _
 from slicer.i18n import translate
 from slicer.ScriptedLoadableModule import (
@@ -286,16 +287,16 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def ensureNgffZarr():
-        try:
-            import ngff_zarr  # noqa: F401
-        except ImportError:
-            if slicer.util.mainWindow() and not slicer.app.testingEnabled():
-                if not slicer.util.confirmOkCancelDisplay(
-                    _("The 'ngff-zarr' Python package is required to read OME-Zarr images. Install it now?")
-                ):
-                    raise RuntimeError("ngff-zarr is not installed") from None
+        # From 0.46.1 on, ngff-zarr fills NgffImage.axes_orientations from the RFC-4 metadata on read.
+        requirement = "ngff-zarr[remote]>=0.46.1"
+        if not slicer.packaging.pip_check(requirement):
+            interactive = slicer.util.mainWindow() and not slicer.app.testingEnabled()
+            if interactive and not slicer.util.confirmOkCancelDisplay(
+                _("ngff-zarr 0.46.1 or newer is required to read OME-Zarr images. Install it now?")
+            ):
+                raise RuntimeError("ngff-zarr 0.46.1 or newer is not installed")
             with slicer.util.tryWithErrorDisplay(_("Failed to install ngff-zarr"), waitCursor=True):
-                slicer.util.pip_install("ngff-zarr[remote]")
+                slicer.util.pip_install(requirement)
         import ngff_zarr
 
         return ngff_zarr
@@ -438,34 +439,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                     userMessages.AddMessage(vtk.vtkCommand.WarningEvent, message)
         return factors
 
-    @staticmethod
-    def axesOrientations(image, metadata=None):
-        """RFC-4 orientation per spatial axis.
-
-        ``NgffImage.axes_orientations`` when set (ngff-zarr >= PR #741), otherwise the
-        raw axis metadata of the multiscales entry.
-        """
-        from ngff_zarr.rfc4 import AnatomicalOrientation, AnatomicalOrientationValues
-
-        orientations = dict(image.axes_orientations or {})
-        for axis in getattr(metadata, "axes", None) or []:
-            name = getattr(axis, "name", None)
-            if name in orientations or name not in SPATIAL_DIMS:
-                continue
-            orientation = getattr(axis, "orientation", None)
-            if isinstance(orientation, dict):
-                value = orientation.get("value")
-                if orientation.get("type", "anatomical") == "anatomical" and value:
-                    try:
-                        orientations[name] = AnatomicalOrientation(value=AnatomicalOrientationValues(value))
-                    except ValueError:
-                        logging.warning(f"Unknown anatomical orientation '{value}' for axis '{name}'")
-            elif orientation is not None and hasattr(orientation, "value"):
-                orientations[name] = orientation
-        return orientations
-
     @classmethod
-    def ijkToRasMatrix(cls, image, userMessages=None, metadata=None):
+    def ijkToRasMatrix(cls, image, userMessages=None):
         """4x4 IJK->RAS (mm) and the orientation source ("rfc4", "assumed-LPS", "assumed-RAS").
 
         NGFF x/y/z are ITK/LPS physical axes (the ngff-zarr convention) and ``translation``
@@ -477,7 +452,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         dims = list(image.dims)
         factors = cls.unitScaleToMm(image, userMessages)
         spatialDims = [d for d in SPATIAL_DIMS if d in dims]
-        orientations = cls.axesOrientations(image, metadata)
+        orientations = image.axes_orientations or {}
         columns = {}
         if spatialDims and all(d in orientations for d in spatialDims):
             for d in spatialDims:
@@ -803,7 +778,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 vtk.vtkCommand.MessageEvent, f"Time axis has {timePoints} points; loaded index {timeIndex}."
             )
 
-        ijkToRas, orientationSource = cls.ijkToRasMatrix(image, userMessages, multiscales.metadata)
+        ijkToRas, orientationSource = cls.ijkToRasMatrix(image, userMessages)
         if region:
             start = np.array([region.get(d, (0, None))[0] for d in SPATIAL_DIMS], dtype=float)
             ijkToRas = ijkToRas.copy()
@@ -916,9 +891,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 labelLevel = cls.matchingLevel(labelMultiscales, image)
                 region = None
                 if rasBounds is not None:
-                    region = cls.regionFromRasBounds(
-                        labelMultiscales.images[labelLevel], rasBounds, labelMultiscales.metadata
-                    )
+                    region = cls.regionFromRasBounds(labelMultiscales.images[labelLevel], rasBounds)
                 nodes += cls.loadLabelStore(
                     labelPath, labelLevel, region, f"{baseName}_{labelName}", userMessages, labelMultiscales, progress
                 )
@@ -971,7 +944,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             level = cls.selectLevel(multiscales, maxBytes or cls.maxBytesFromSettings())
         image = multiscales.images[int(level)]
         dims = list(image.dims)
-        ijkToRas, orientationSource = cls.ijkToRasMatrix(image, userMessages, multiscales.metadata)
+        ijkToRas, orientationSource = cls.ijkToRasMatrix(image, userMessages)
         if region:
             start = np.array([region.get(d, (0, None))[0] for d in SPATIAL_DIMS], dtype=float)
             ijkToRas = ijkToRas.copy()
@@ -1050,9 +1023,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     # ---- region of interest ----
 
     @classmethod
-    def regionFromRasBounds(cls, image, rasBounds, metadata=None):
+    def regionFromRasBounds(cls, image, rasBounds):
         """Map RAS bounds [xmin,xmax,ymin,ymax,zmin,zmax] to index ranges at this level."""
-        ijkToRas, _source = cls.ijkToRasMatrix(image, metadata=metadata)
+        ijkToRas, _source = cls.ijkToRasMatrix(image)
         rasToIjk = np.linalg.inv(ijkToRas)
         corners = np.array(
             [[rasBounds[i], rasBounds[2 + j], rasBounds[4 + k], 1.0] for i in (0, 1) for j in (0, 1) for k in (0, 1)]
@@ -1077,7 +1050,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         multiscales = cls.openMultiscales(path)
         bounds = [0.0] * 6
         roiNode.GetRASBounds(bounds)
-        region = cls.regionFromRasBounds(multiscales.images[int(level)], bounds, multiscales.metadata)
+        region = cls.regionFromRasBounds(multiscales.images[int(level)], bounds)
         return cls.loadImage(
             path,
             level=level,
@@ -1188,7 +1161,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         chosen = None
         for level, image in enumerate(multiscales.images):
             try:
-                region = cls.regionFromRasBounds(image, bounds, multiscales.metadata)
+                region = cls.regionFromRasBounds(image, bounds)
             except ValueError:
                 continue
             if cls.volumeBytes(image, region) * channels <= budget:
@@ -1899,7 +1872,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         timePoints = self.logic.axisLength(image, "t")
         self.timeIndexSpinBox.setRange(-1, max(-1, timePoints - 1))
         self.timeIndexSpinBox.value = -1 if timePoints > 1 else 0
-        _matrix, source = self.logic.ijkToRasMatrix(image, metadata=self.multiscales.metadata)
+        _matrix, source = self.logic.ijkToRasMatrix(image)
         labels = labelGroupNames(path)
         self.infoLabel.text = _(
             "Orientation: {source}. Channels: {channels}. Time points: {t}. Labels: {labels}."
@@ -2278,9 +2251,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         refinedT = OMEZarrLogic.refineView(storePath, "Red")
         self.assertEqual(refinedT[0].GetAttribute("OMEZarr.TimeIndex"), "2")
         multiscales = OMEZarrLogic.openMultiscales(storePath)
-        region = OMEZarrLogic.regionFromRasBounds(
-            multiscales.images[0], OMEZarrLogic.sliceViewRasBounds("Red"), multiscales.metadata
-        )
+        region = OMEZarrLogic.regionFromRasBounds(multiscales.images[0], OMEZarrLogic.sliceViewRasBounds("Red"))
         expected = data[2, 0][tuple(slice(*region[d]) for d in ("z", "y", "x"))]
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(refinedT[0]), expected)
 

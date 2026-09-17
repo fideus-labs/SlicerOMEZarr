@@ -4,14 +4,38 @@
 [OME-Zarr](https://ngff.openmicroscopy.org/) (OME-NGFF) images.
 Reading and writing go through [ngff-zarr](https://github.com/fideus-labs/ngff-zarr).
 
-I like working in Slicer, and until now I had to convert every mouse-brain
-OME-Zarr dataset to NIfTI just to look at it. This extension removes that step.
+OME-Zarr, also called OME-NGFF, is an open format for large multidimensional
+images, specified by the [Open Microscopy Environment](https://www.openmicroscopy.org/)
+community. An image is cut into compressed chunks, usually stored at several
+resolutions, and its physical description (voxel spacing, units, orientation,
+channels, labels) is kept next to the pixels as JSON. Imaging archives such as
+the [Image Data Resource](https://idr.openmicroscopy.org/) and collections such
+as the [OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets)
+publish images this way. Stores range from megabytes to terabytes and can live
+on a local disk, a web server or cloud storage; the same store opens in napari,
+Neuroglancer, web viewers and Python.
 
-![Walkthrough: drop the store, refine a view, drop the mask](Screenshots/walkthrough.gif)
+With this extension, in Slicer:
 
-Recorded on an ExaSPIM mouse brain (2.3 GB, 30 µm). Full video with
-captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4)
-(1 min 50). Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
+* **No conversion step.** Drag an `.ome.zarr` directory onto Slicer, or open an
+  `https://` or `s3://` address, without making an NRRD or NIfTI copy first.
+* **Images larger than memory.** The finest resolution level that fits the
+  memory budget loads first. Refine a slice view, with a click or automatically
+  while browsing, and it reloads what it shows at a finer level, up to full
+  resolution, reading only the chunks it needs.
+* **Regular Slicer data.** Images become scalar volumes, labels become label
+  maps or segmentations and time series become sequences, so segmentation,
+  registration and volume rendering work as usual.
+* **Results other tools can read.** Volumes, label maps and segmentations are
+  saved as multiscale OME-Zarr, with orientation, label names and colours.
+
+![Walkthrough: refine the slice views of a public S3 store, then render it in 3D](Screenshots/walkthrough.gif)
+
+Recorded on a public CT scan of a chameleon from the
+[OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets),
+read from S3 (2.1 GiB at 0.09 mm). Full video with captions:
+[SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4) (1 min 34).
+Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
 
 ## Usage
 
@@ -28,11 +52,11 @@ captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tutorial.mp4)
 
   ```python
   slicer.util.loadNodeFromFile("/data/brain.ome.zarr", "OMEZarr", {"level": 1})
-  slicer.util.loadNodeFromFile("https://host/brain.ome.zarr", "OMEZarr")
+  slicer.util.loadNodeFromFile("s3://ome-zarr-scivis/v0.5/96x2/chameleon.ome.zarr", "OMEZarr")
   ```
 
-The `ngff-zarr[remote]` Python package is installed into Slicer's Python on
-first use.
+Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
+0.46.1 or newer, is installed into Slicer's Python on first use.
 
 ## What works
 
