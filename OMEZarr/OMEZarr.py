@@ -1766,8 +1766,8 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         refineLayout = qt.QFormLayout(refineBox)
 
         self.viewSelector = qt.QComboBox()
-        self.viewSelector.addItems(["Red", "Yellow", "Green"])
-        self.viewSelector.setToolTip(_("Slice view to refine"))
+        self.viewSelector.setToolTip(_("The 2D view that 'Refine view' and 'New ROI in view' act on"))
+        self.updateViewSelector()
         self.refineButton = qt.QPushButton(_("Refine view"))
         self.refineButton.setToolTip(
             _("Reload the block shown by the slice view at the finest level that fits the memory budget")
@@ -1775,7 +1775,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         refineRow = qt.QHBoxLayout()
         refineRow.addWidget(self.viewSelector)
         refineRow.addWidget(self.refineButton, 1)
-        refineLayout.addRow(_("Slice view:"), refineRow)
+        refineLayout.addRow(_("2D view:"), refineRow)
 
         self.autoRefineCheckBox = qt.QCheckBox(_("Refine the slice views automatically while browsing"))
         self.autoRefineCheckBox.setToolTip(_("Reloads a view's block after it has been still for half a second"))
@@ -1899,8 +1899,19 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             "editingFinished()", lambda: Settings.set(Settings.STORAGE_OPTIONS, self.storageOptionsEdit.text)
         )
 
+    def updateViewSelector(self):
+        """List the slice views of the current layout as "Red (Axial)", keeping the selection."""
+        layoutManager = slicer.app.layoutManager()
+        current = self.viewSelector.currentData
+        self.viewSelector.clear()
+        for name in layoutManager.sliceViewNames():
+            orientation = layoutManager.sliceWidget(name).mrmlSliceNode().GetOrientation()
+            self.viewSelector.addItem(f"{name} ({orientation})", name)
+        self.viewSelector.setCurrentIndex(max(0, self.viewSelector.findData(current)))
+
     def enter(self):
         """Show the store of the displayed OME-Zarr volume, else the last one used."""
+        self.updateViewSelector()
         if self.path:
             self.updateLevelStatus()
             return
@@ -2070,7 +2081,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
     def onRefine(self):
         if not self.path:
             return
-        view = self.viewSelector.currentText
+        view = self.viewSelector.currentData
         try:
             with Progress(_("Refining view...")) as progress:
                 nodes = self.logic.refineView(
@@ -2101,7 +2112,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
     def onCreateRoi(self):
         """A region of interest already placed: the middle half of what the slice view shows."""
-        view = self.viewSelector.currentText
+        view = self.viewSelector.currentData
         bounds = self.logic.sliceViewRasBounds(view)
         center = [(bounds[i] + bounds[i + 1]) / 2.0 for i in (0, 2, 4)]
         size = [(bounds[i + 1] - bounds[i]) / 2.0 for i in (0, 2, 4)]
@@ -2831,7 +2842,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         widget.onLoadRegion()
         self.assertEqual(len(regionNodes()), regionsBefore + 1)
         # A refusal is reported in the panel, not in a popup.
-        widget.viewSelector.setCurrentText("Red")
+        widget.viewSelector.setCurrentIndex(widget.viewSelector.findData("Red"))
+        self.assertEqual(widget.viewSelector.currentText, "Red (Axial)")
         Settings.set(Settings.MAX_BYTES, 1024)
         widget.onRefine()
         Settings.set(Settings.MAX_BYTES, 0)
