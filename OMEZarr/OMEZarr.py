@@ -1491,6 +1491,14 @@ class AutoRefiner:
         else:
             self.timer.start()
 
+    @staticmethod
+    def tolerance(bounds):
+        """A view counts as still when it moved by less than 1% of its smallest extent."""
+        return 0.01 * min(bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4])
+
+    def idle(self):
+        return not self.busy and not self.timer.isActive()
+
     def viewBudget(self):
         return (self.maxBytes or OMEZarrLogic.maxBytesFromSettings()) // max(1, len(self.sliceViewNames))
 
@@ -1506,7 +1514,7 @@ class AutoRefiner:
                 except ValueError:
                     continue
                 previous = self.lastBounds.get(viewName)
-                if previous is not None and np.allclose(bounds, previous, rtol=0.0, atol=1e-6):
+                if previous is not None and np.allclose(bounds, previous, rtol=0.0, atol=self.tolerance(bounds)):
                     continue
                 self.lastBounds[viewName] = bounds
                 try:
@@ -2597,25 +2605,28 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             return OMEZarrLogic.refinedNodes(storePath)
 
         refiner = OMEZarrLogic.startAutoRefine(storePath, "Red", delayMs=200, maxBytes=budget)
-        self.assertTrue(self.waitFor(lambda: refiner.refreshCount == 1))
+        # The layout may still settle while the first block loads; wait until the refiner rests.
+        self.assertTrue(self.waitFor(lambda: refiner.refreshCount >= 1 and refiner.idle()))
         first = refined()
         self.assertEqual(len(first), 1)
         firstOrigin = np.array(first[0].GetOrigin())
 
         # A still view does not reload.
-        self.assertFalse(self.waitFor(lambda: refiner.refreshCount > 1, timeoutSeconds=1.0))
+        settled = refiner.refreshCount
+        self.assertFalse(self.waitFor(lambda: refiner.refreshCount > settled, timeoutSeconds=1.0))
 
         # Panning reloads once the view is still again, replacing the previous block.
         sliceNode.JumpSliceByCentering(center[0] + 25.0, center[1], center[2])
-        self.assertTrue(self.waitFor(lambda: refiner.refreshCount == 2))
+        self.assertTrue(self.waitFor(lambda: refiner.refreshCount > settled and refiner.idle()))
         second = refined()
         self.assertEqual(len(second), 1)
         self.assertGreater(np.abs(np.array(second[0].GetOrigin()) - firstOrigin).max(), 10.0)
 
         OMEZarrLogic.stopAutoRefine(storePath)
         self.assertIsNone(OMEZarrLogic.autoRefiner(storePath))
+        stopped = refiner.refreshCount
         sliceNode.JumpSliceByCentering(center[0] - 25.0, center[1], center[2])
-        self.assertFalse(self.waitFor(lambda: refiner.refreshCount > 2, timeoutSeconds=1.0))
+        self.assertFalse(self.waitFor(lambda: refiner.refreshCount > stopped, timeoutSeconds=1.0))
 
     def test_MultiViewRefine(self):
         self.delayDisplay("Each slice view keeps its own refined block with the coarse window/level")
