@@ -29,9 +29,9 @@ With this extension, in Slicer:
 * **Results other tools can read.** Volumes, label maps and segmentations are
   saved as multiscale OME-Zarr, with orientation, label names and colours.
 
-[![Watch the walkthrough video (1 min 30)](Screenshots/main.png)](Screenshots/SlicerOMEZarr-tutorial.mp4)
+[![Watch the walkthrough video (1 min)](Screenshots/main.png)](Screenshots/SlicerOMEZarr-tutorial.mp4)
 
-**[Watch the walkthrough video](Screenshots/SlicerOMEZarr-tutorial.mp4)** (1 min 30, with captions), recorded on
+**[Watch the walkthrough video](Screenshots/SlicerOMEZarr-tutorial.mp4)** (1 min, with captions), recorded on
 a public CT scan of a chameleon from the
 [OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets),
 read from S3 (2.1 GiB at 0.09 mm). Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
