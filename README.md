@@ -97,6 +97,13 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   volume is held once in memory, not twice.
 * **Progress and cancel** while reading.
 
+## Modules
+
+* **OME-Zarr** (Informatics): inspects the resolution levels of a store, loads
+  a level or a region of interest, refines slice views at full resolution, and
+  holds the settings. It also registers the OME-Zarr file reader, file writer
+  and drop handler.
+
 ## Still to do
 
 * `Add Data → Choose Directory to Add` lists the chunk files instead of the
@@ -115,3 +122,7 @@ OMEZARR_TEST_REMOTE=1 Testing/run_headless_test.sh /path/to/Slicer # also test a
 
 The same self-test runs in GitHub Actions against the latest stable Slicer on
 Linux, macOS and Windows.
+
+## License
+
+[MIT](LICENSE).

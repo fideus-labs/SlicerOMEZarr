@@ -1,13 +1,13 @@
 cmake_minimum_required(VERSION 3.16.3...3.19.7 FATAL_ERROR)
 
-project(SlicerOMEZarr)
+project(OMEZarr)
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
 set(EXTENSION_HOMEPAGE "https://github.com/fideus-labs/SlicerOMEZarr")
 set(EXTENSION_CATEGORY "Informatics")
 set(EXTENSION_CONTRIBUTORS "Valentin Boussot (Fideus Labs), Matt McCormick (Fideus Labs)")
-set(EXTENSION_DESCRIPTION "Read and write OME-Zarr (OME-NGFF) images in 3D Slicer: multiscale level selection by memory budget, labels, time series as sequences, RFC-4 anatomical orientation mapped to RAS, view-driven refinement and region-of-interest loading from local or remote stores.")
+set(EXTENSION_DESCRIPTION "Open and save OME-Zarr (OME-NGFF) images, the chunked multi-resolution format used for large microscopy and medical volumes, from a local folder or a web address. Large images open at a resolution that fits in memory, and slice views can then be refined to full resolution.")
 set(EXTENSION_ICONURL "https://raw.githubusercontent.com/fideus-labs/SlicerOMEZarr/main/SlicerOMEZarr.png")
 set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/fideus-labs/SlicerOMEZarr/main/Screenshots/main.png")
 set(EXTENSION_DEPENDS "NA")
