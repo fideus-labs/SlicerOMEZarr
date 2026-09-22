@@ -34,9 +34,9 @@ https://github.com/user-attachments/assets/da9256d2-1c8a-4734-b562-e6e754b26ca0
 
 
 **[Watch the walkthrough video](Screenshots/SlicerOMEZarr-tutorial.mp4)** (1 min, with captions), recorded on
-a public CT scan of a chameleon from the
+a public two-photon image of GFP-labelled neurons in a marmoset cortex from the
 [OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets),
-read from S3 (2.1 GiB at 0.09 mm). Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
+read from S3 (314 MiB at 0.5 µm). Step by step with screenshots: [TUTORIAL.md](TUTORIAL.md).
 
 ## Usage
 
@@ -53,7 +53,7 @@ read from S3 (2.1 GiB at 0.09 mm). Step by step with screenshots: [TUTORIAL.md](
 
   ```python
   slicer.util.loadNodeFromFile("/data/brain.ome.zarr", "OMEZarr", {"level": 1})
-  slicer.util.loadNodeFromFile("s3://ome-zarr-scivis/v0.5/96x2/chameleon.ome.zarr", "OMEZarr")
+  slicer.util.loadNodeFromFile("s3://ome-zarr-scivis/v0.5/96x2/marmoset_neurons.ome.zarr", "OMEZarr")
   ```
 
 Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version

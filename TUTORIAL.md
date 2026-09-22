@@ -4,12 +4,14 @@ Video with captions: [SlicerOMEZarr-tutorial.mp4](Screenshots/SlicerOMEZarr-tuto
 
 Recorded on a public store of the
 [OME-Zarr Open SciVis Datasets](https://github.com/InsightSoftwareConsortium/OMEZarrOpenSciVisDatasets),
-read straight from `s3://ome-zarr-scivis/v0.5/96x2/chameleon.ome.zarr`: a CT
-scan of a chameleon (*Chamaeleo calyptratus*, Digital Morphology, 2003),
-OME-Zarr 0.5, 1024 × 1024 × 1080 voxels of 0.092 × 0.092 × 0.105 mm, uint16,
-four levels of 2160, 270, 33.8 and 4.2 MiB. The memory budget was set to
-128 MiB so that a coarse level loads first. A local `.ome.zarr` folder works
-the same way.
+read straight from `s3://ome-zarr-scivis/v0.5/96x2/marmoset_neurons.ome.zarr`:
+GFP-labelled pyramidal neurons in the visual cortex of a marmoset, cleared and
+imaged on a two-photon microscope (Frederick Federer, Moran Eye Institute,
+University of Utah). OME-Zarr 0.5, 1024 × 1024 × 314 voxels of
+0.497 × 0.497 × 1.5 µm, uint8, four levels of 314, 78.5, 9.8 and 2.5 MiB. The
+store declares no unit, so its micrometres are read as millimetres. The memory
+budget was set to 32 MiB so that a coarse level loads first. A local
+`.ome.zarr` folder works the same way.
 
 1. **Install** the extension and open the OME-Zarr module (Informatics).
    `ngff-zarr` is installed into Slicer's Python on first use.
@@ -26,19 +28,20 @@ the same way.
 
    ![Levels of the store](Screenshots/tutorial/02-levels.jpg)
 
-3. **Load a level.** "Load selected level" reads level 2 (33.8 MiB) in a few
+3. **Load a level.** "Load selected level" reads level 2 (9.8 MiB) in a few
    seconds; Slicer stays responsive while it reads. Spacing and origin come
-   from the store, in mm. Loaded levels get a ✓ in the table. Without RFC-4
+   from the store. Loaded levels get a ✓ in the table. Without RFC-4
    orientation the axes are taken as LPS (or RAS, in the settings). The window
-   was set to 2000 to 50000 to show bone.
+   was set to 4 to 140 with the Green colour table, and the 3D view shows a
+   maximum intensity projection of the loaded level.
 
    ![Coarse level loaded](Screenshots/tutorial/03-loaded.jpg)
 
-4. **Refine a view.** Zoom a 2D view on what you care about, here the skull,
+4. **Refine a view.** Zoom a 2D view on what you care about, here two neurons,
    pick that view in "2D view" and click "Refine view". The block the view
    shows is read again at the finest level that fits the budget, only the
    chunks it needs, and laid over the coarse volume with the same contrast.
-   The panel reports what was loaded (here level 0, about 29 MiB). If nothing
+   The panel reports what was loaded (here level 0, about 0.5 MiB). If nothing
    finer than what is displayed fits, the panel tells you to zoom in.
 
    ![Refined view](Screenshots/tutorial/04-refined.jpg)
@@ -54,13 +57,14 @@ the same way.
    appears in the middle of the selected view. Drag its handles in the 2D
    views, select a level in the table, and click "Load region at the selected
    level". The result is an ordinary Slicer volume at that resolution, ready
-   to segment, register or save.
+   to segment, register or save (here 496 × 480 × 40 voxels of level 0,
+   9.1 MiB).
 
    ![Region of interest](Screenshots/tutorial/06-region.jpg)
 
 7. **Everything else** is ordinary Slicer, for example volume rendering of the
-   loaded level. Stores with `labels/` groups load as label maps or
-   Segmentations, time series as Sequences, and `File → Save` with the
+   region loaded at full resolution. Stores with `labels/` groups load as label
+   maps or Segmentations, time series as Sequences, and `File → Save` with the
    "OME-Zarr image" format writes volumes, label maps and segmentations back
    as multiscale stores.
 
@@ -74,7 +78,7 @@ the same way.
 From Python:
 
 ```python
-url = "s3://ome-zarr-scivis/v0.5/96x2/chameleon.ome.zarr"
+url = "s3://ome-zarr-scivis/v0.5/96x2/marmoset_neurons.ome.zarr"
 slicer.util.loadNodeFromFile(url, "OMEZarr", {"level": 2})
 from OMEZarr import OMEZarrLogic
 OMEZarrLogic.refineView(url, "Red")
