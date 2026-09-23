@@ -367,13 +367,14 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     @staticmethod
     def ensureNgffZarr():
         # From 0.46.1 on, ngff-zarr fills NgffImage.axes_orientations from the RFC-4 metadata on read.
-        requirement = "ngff-zarr[remote]>=0.46.1"
+        # 0.47.0 writes OME-Zarr 0.6 (for oblique volumes) tagged "0.6"; 0.46.1 tags it "0.6rc0".
+        requirement = "ngff-zarr[remote]>=0.47.0"
         if not slicer.packaging.pip_check(requirement):
             interactive = slicer.util.mainWindow() and not slicer.app.testingEnabled()
             if interactive and not slicer.util.confirmOkCancelDisplay(
-                _("ngff-zarr 0.46.1 or newer is required to read OME-Zarr images. Install it now?")
+                _("ngff-zarr 0.47.0 or newer is required to read OME-Zarr images. Install it now?")
             ):
-                raise RuntimeError("ngff-zarr 0.46.1 or newer is not installed")
+                raise RuntimeError("ngff-zarr 0.47.0 or newer is not installed")
             with slicer.util.tryWithErrorDisplay(_("Failed to install ngff-zarr"), waitCursor=True):
                 slicer.util.pip_install(requirement)
         import ngff_zarr
