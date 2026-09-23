@@ -12,6 +12,7 @@ Registers:
 NGFF parsing, multiscales, store access and RFC-4 orientation come from ngff-zarr.
 """
 
+import functools
 import json
 import logging
 import os
@@ -276,6 +277,23 @@ def runResponsive(work, onTick=None):
     if "error" in outcome:
         raise outcome["error"]
     return outcome.get("result")
+
+
+def removesNodesWhenCancelled(function):
+    """Remove the nodes ``function`` added to the scene when it is cancelled (InterruptedError)."""
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        before = {node.GetID() for node in slicer.util.getNodesByClass("vtkMRMLNode")}
+        try:
+            return function(*args, **kwargs)
+        except InterruptedError:
+            for node in slicer.util.getNodesByClass("vtkMRMLNode"):
+                if node.GetID() not in before and node.GetScene() is not None:  # display nodes go with their volume
+                    slicer.mrmlScene.RemoveNode(node)
+            raise
+
+    return wrapper
 
 
 #
@@ -741,6 +759,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     # ---- loading ----
 
     @classmethod
+    @removesNodesWhenCancelled
     def loadImage(
         cls,
         path,
@@ -2264,6 +2283,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_WidgetInspectsByItself()
             self.test_ReadsKeepTheApplicationResponsive()
             self.test_Settings()
+            self.test_CancelledLoadLeavesNothing()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -2933,6 +2953,18 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(OMEZarrLogic.maxBytesFromSettings(), FALLBACK_MAX_BYTES // 16)
         Settings.set(Settings.MAX_BYTES, 12345)
         self.assertEqual(OMEZarrLogic.maxBytesFromSettings(), 12345)
+
+    def test_CancelledLoadLeavesNothing(self):
+        self.delayDisplay("A cancelled load removes the nodes it added")
+        import SampleData
+
+        mrHead = SampleData.SampleDataLogic().downloadMRHead()
+        storePath = os.path.join(self.tempDir, "cancelled.ome.zarr")
+        self.assertTrue(self.saveAsOmeZarr(mrHead, storePath))
+        nodeCount = slicer.mrmlScene.GetNumberOfNodes()
+        with self.assertRaises(InterruptedError):
+            OMEZarrLogic.loadImage(storePath, level=0, progress=lambda done, total, text=None: False)
+        self.assertEqual(slicer.mrmlScene.GetNumberOfNodes(), nodeCount)
 
     def test_RemoteStore(self):
         self.delayDisplay("Remote HTTPS store (IDR)")
