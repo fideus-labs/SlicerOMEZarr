@@ -21,8 +21,8 @@ budget was set to 32 MiB so that a coarse level loads first. A local
 2. **Open a store.** Paste an `https://` or `s3://` address in the Store
    field, or choose a local folder. The levels are listed right away, with
    their voxels, spacing and memory. The level in bold is the one the memory
-   budget selects. Public S3 buckets are read anonymously when no AWS
-   credentials are set. You can also drop a local store onto the Slicer window
+   budget selects. S3 is read anonymously unless credentials are given in
+   the environment or in the settings. You can also drop a local store onto the Slicer window
    ("Load OME-Zarr image"), or use `File → Add Data` with its `zarr.json` or
    `.zattrs`.
 

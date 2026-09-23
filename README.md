@@ -89,9 +89,10 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   OME-Zarr, with RFC-4 orientation from the IJK→RAS matrix and `image-label`
   names and colours from the colour table or the segments.
 * **Stores**: local directories, `.ozx` files, `https://` and `s3://`, and
-  bioformats2raw containers (every image series is loaded). Public S3 buckets
-  are read anonymously when no AWS credentials are configured; other options
-  (region, endpoint, credentials) go in the module settings as JSON. Writing
+  bioformats2raw containers (every image series is loaded). S3 is read
+  anonymously unless credentials are given in the environment
+  (`AWS_ACCESS_KEY_ID`) or in the module settings as JSON, along with the
+  region or endpoint; `~/.aws` files are not read. Writing
   targets a local directory by design, as in ngff-zarr; upload it afterwards.
 * **Memory**: volumes are read slab by slab straight into the VTK buffer, so a
   volume is held once in memory, not twice.

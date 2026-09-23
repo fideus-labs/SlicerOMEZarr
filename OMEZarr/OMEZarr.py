@@ -340,9 +340,12 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def storageOptions(path):
-        """Options for a remote store: the configured JSON, and anonymous S3 access when no
-        AWS credentials are configured (otherwise obstore spends half a minute asking the EC2
-        metadata service before failing on a public bucket)."""
+        """Options for a remote store: the configured JSON, and anonymous S3 access unless
+        credentials are given in the environment or in that JSON.
+
+        obstore only reads credentials from the environment, not from ``~/.aws``; without
+        ``anon`` it asks the EC2 metadata service for half a minute and then fails on a
+        public bucket."""
         if not isRemoteUrl(path):
             return None
         options = {}
@@ -353,9 +356,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             except ValueError:
                 logging.warning("Ignoring invalid JSON in the OME-Zarr storage options setting")
         if str(path).startswith("s3://") and "anon" not in options and "skip_signature" not in options:
-            hasCredentials = any(
-                os.environ.get(name) for name in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_SESSION_TOKEN")
-            ) or os.path.isfile(os.path.expanduser("~/.aws/credentials"))
+            variables = ("AWS_ACCESS_KEY_ID", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+            keys = ("access_key_id", "aws_access_key_id", "secret_access_key", "token")
+            hasCredentials = any(os.environ.get(name) for name in variables) or any(key in options for key in keys)
             if not hasCredentials:
                 options["anon"] = True
         return options or None
@@ -1866,7 +1869,11 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.storageOptionsEdit = qt.QLineEdit(Settings.get(Settings.STORAGE_OPTIONS, ""))
         self.storageOptionsEdit.setPlaceholderText('{"anon": true, "region": "us-west-2"}')
         self.storageOptionsEdit.setToolTip(
-            _("JSON storage options for remote stores (S3 credentials, endpoint, region)")
+            _(
+                "JSON storage options for remote stores: S3 credentials, endpoint, region. "
+                "S3 is read anonymously unless credentials are given here or in the environment "
+                "(AWS_ACCESS_KEY_ID); ~/.aws files are not read."
+            )
         )
         settingsLayout.addRow(_("Remote storage options:"), self.storageOptionsEdit)
 
@@ -2758,14 +2765,19 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(len(OMEZarrLogic.refinedNodes(storePath)), before)
 
     def test_StorageOptions(self):
-        self.delayDisplay("Remote storage options: configured JSON, anonymous S3 without credentials")
+        self.delayDisplay("Remote storage options: configured JSON, anonymous S3 unless credentials are given")
         self.assertIsNone(OMEZarrLogic.storageOptions("/local/store.ome.zarr"))
-        saved = {name: os.environ.pop(name, None) for name in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_SESSION_TOKEN")}
+        names = ("AWS_ACCESS_KEY_ID", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+        saved = {name: os.environ.pop(name, None) for name in names}
         try:
-            options = OMEZarrLogic.storageOptions("s3://bucket/store.ome.zarr")
-            if not os.path.isfile(os.path.expanduser("~/.aws/credentials")):
-                self.assertEqual(options, {"anon": True})
+            # A ~/.aws/credentials file does not count: obstore does not read it.
+            self.assertEqual(OMEZarrLogic.storageOptions("s3://bucket/store.ome.zarr"), {"anon": True})
             self.assertIsNone(OMEZarrLogic.storageOptions("https://host/store.ome.zarr"))
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            self.assertIsNone(OMEZarrLogic.storageOptions("s3://bucket/store.ome.zarr"))
+            del os.environ["AWS_ACCESS_KEY_ID"]
+            Settings.set(Settings.STORAGE_OPTIONS, '{"access_key_id": "AKIATEST", "secret_access_key": "x"}')
+            self.assertNotIn("anon", OMEZarrLogic.storageOptions("s3://bucket/store.ome.zarr"))
             Settings.set(Settings.STORAGE_OPTIONS, '{"region": "us-west-2", "anon": false}')
             options = OMEZarrLogic.storageOptions("s3://bucket/store.ome.zarr")
             self.assertEqual(options["region"], "us-west-2")
