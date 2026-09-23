@@ -286,28 +286,52 @@ def runResponsive(work, onTick=None):
 class Progress:
     """Progress dialog with a cancel button when the GUI is up; silent otherwise.
 
-    Used as ``progress(done, total, text)``; returns False once the user cancelled.
+    Used as ``progress(done, total, text)``; returns False once the user cancelled. While Slicer's
+    IO manager loads ``fileName``, its own dialog is driven instead of opening a second one.
     """
 
-    def __init__(self, label):
+    def __init__(self, label, fileName=None):
         self.label = label
+        self.fileName = fileName
         self.dialog = None
+        self.owned = False
 
     def __enter__(self):
         if slicer.util.mainWindow() and not slicer.app.testingEnabled():
-            self.dialog = slicer.util.createProgressDialog(labelText=self.label, windowTitle=_("OME-Zarr"), maximum=100)
+            self.dialog = self.ioManagerDialog()
+            if self.dialog is None:
+                self.dialog = slicer.util.createProgressDialog(
+                    labelText=self.label, windowTitle=_("OME-Zarr"), maximum=100
+                )
+                self.owned = True
+            else:
+                self.dialog.setCancelButtonText(_("Cancel"))  # Slicer leaves it out for a single file
         return self
+
+    def ioManagerDialog(self):
+        """The dialog the IO manager opens around a load, labelled with the file name."""
+        if not self.fileName:
+            return None
+        return next(
+            (
+                widget
+                for widget in slicer.app.topLevelWidgets()
+                if isinstance(widget, qt.QProgressDialog) and self.fileName in widget.labelText
+            ),
+            None,
+        )
 
     def __call__(self, done, total, text=None):
         if self.dialog is None:
             return True
-        self.dialog.value = int(100 * done / max(1, total))
+        if self.dialog.maximum == 100:  # with several files, the IO manager's bar counts files
+            self.dialog.value = min(99, int(100 * done / max(1, total)))  # 100 resets and hides the dialog
         if text:
             self.dialog.labelText = text
         return not self.dialog.wasCanceled
 
     def __exit__(self, *args):
-        if self.dialog is not None:
+        if self.owned:
             self.dialog.close()
         return False
 
@@ -1574,7 +1598,7 @@ class OMEZarrFileReader:
                 value = properties.get(key)
                 return cast(value) if value not in (None, "") else None
 
-            with Progress(_("Loading OME-Zarr...")) as progress:
+            with Progress(_("Loading OME-Zarr..."), properties["fileName"]) as progress:
                 nodes = OMEZarrLogic.loadImage(
                     root,
                     level=optional("level", int),
