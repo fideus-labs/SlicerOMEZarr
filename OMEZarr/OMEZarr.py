@@ -422,6 +422,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         multiscales = (
             ngff_zarr.from_ome_zarr(source, storage_options=options) if options else ngff_zarr.from_ome_zarr(source)
         )
+        cls.attachAffine(multiscales)
         if useCache:
             cls._multiscalesCache[key] = multiscales
         return multiscales
@@ -565,7 +566,47 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         ijkToPhysical = np.eye(4)
         ijkToPhysical[:3, :3] = direction @ np.diag(spacing)
         ijkToPhysical[:3, 3] = origin
+        affine = getattr(image, "_omezarrAffine", None)
+        if affine is not None:
+            affine = affine.copy()
+            affine[:3, 3] *= factors.get("x", 1.0)
+            ijkToPhysical = affine @ ijkToPhysical
+            source += "+affine"
         return toRas @ ijkToPhysical, source
+
+    @staticmethod
+    def attachAffine(multiscales):
+        """Attach an OME-Zarr 0.6 (RFC-5) intrinsic -> physical affine, as LPS (x,y,z) 4x4, to every level.
+
+        Only a single affine (or rotation) whose input is the intrinsic coordinate system is used;
+        other transform chains are ignored, as before.
+        """
+        metadata = multiscales.metadata
+        transforms = getattr(metadata, "coordinateTransformations", None) or []
+        try:
+            intrinsic = metadata.intrinsic_coordinate_system.name
+        except Exception:  # noqa: BLE001 - not 0.6 metadata
+            return
+        for transform in transforms:
+            if getattr(transform.input, "name", None) != intrinsic:
+                continue
+            if transform.type == "affine" and transform.affine:
+                rows = np.asarray(transform.affine, dtype=float)
+            elif transform.type == "rotation" and transform.rotation:
+                rows = np.hstack([np.asarray(transform.rotation, dtype=float), np.zeros((3, 1))])
+            else:
+                continue
+            if rows.shape != (3, 4):
+                logging.warning(f"Ignoring OME-Zarr affine of shape {rows.shape}; only 3D is supported")
+                return
+            # Metadata arrays are (z, y, x); reorder to LPS (x, y, z).
+            order = [2, 1, 0]
+            affine = np.eye(4)
+            affine[:3, :3] = rows[:, :3][np.ix_(order, order)]
+            affine[:3, 3] = rows[order, 3]
+            for image in multiscales.images:
+                image._omezarrAffine = affine
+            return
 
     @classmethod
     def regionIjkToRas(cls, image, region=None, userMessages=None):
@@ -1362,7 +1403,53 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             axes_units={d: "millimeter" for d in SPATIAL_DIMS},
         )
         image.axes_orientations = orientations
+        image._omezarrAffine = OMEZarrLogic.residualRotationAffine(direction, orientations, origin)
         return image
+
+    @staticmethod
+    def residualRotationAffine(direction, orientations, origin):
+        """LPS (x,y,z) 4x4 affine for the rotation RFC-4 cannot express, or None if axis-aligned.
+
+        RFC-4 records each axis's nearest anatomical direction (a signed permutation P). The
+        remainder R = direction @ P^T is written as an OME-Zarr 0.6 (RFC-5) affine about the
+        origin, so that affine @ (P, spacing, origin) reproduces the full direction.
+        """
+        from ngff_zarr.rfc4 import anatomical_orientation_to_itk_direction
+
+        snapped = np.column_stack(
+            [anatomical_orientation_to_itk_direction(orientations[d].value) for d in SPATIAL_DIMS]
+        )
+        rotation = direction @ snapped.T
+        if np.allclose(rotation, np.eye(3), atol=1e-9):
+            return None
+        affine = np.eye(4)
+        affine[:3, :3] = rotation
+        affine[:3, 3] = origin - rotation @ origin
+        return affine
+
+    @staticmethod
+    def addAffineToMultiscales(multiscales, affineLps):
+        """Add ``affineLps`` as an intrinsic -> physical RFC-5 affine to 0.6 multiscales metadata."""
+        from ngff_zarr.v06 import zarr_metadata as v06
+
+        metadata = multiscales.metadata
+        intrinsic = metadata.intrinsic_coordinate_system
+        physical = v06.CoordinateSystem(
+            name="physical", axes=[v06.Axis(name=a.name, type=a.type, unit=a.unit) for a in intrinsic.axes]
+        )
+        # Metadata arrays are (z, y, x); reverse the LPS (x, y, z) matrix accordingly.
+        order = [2, 1, 0]
+        matrix = affineLps[np.ix_(order, order)]
+        translation = affineLps[order, 3]
+        metadata.coordinateSystems = [cs for cs in metadata.coordinateSystems if cs.name != "physical"] + [physical]
+        metadata.coordinateTransformations = [
+            v06.Affine(
+                affine=[[float(v) for v in row] + [float(t)] for row, t in zip(matrix, translation)],
+                input=v06.CoordinateSystemIdentifier(name=intrinsic.name),
+                output=v06.CoordinateSystemIdentifier(name="physical"),
+                name="intrinsic_to_physical",
+            )
+        ]
 
     @staticmethod
     def imageLabelFromNode(labelNode, version):
@@ -1410,13 +1497,21 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             except Exception:  # noqa: BLE001 - fall back to a single level rather than fail
                 logging.exception("Multiscale generation failed; writing a single level")
                 multiscales = ngff_zarr.to_multiscales(image, scale_factors=[])
-            ngff_zarr.to_ome_zarr(storePath, multiscales, overwrite=True)
+            affine = getattr(image, "_omezarrAffine", None)
+            if affine is None:
+                ngff_zarr.to_ome_zarr(storePath, multiscales, overwrite=True)
+            else:
+                # Oblique volume: only OME-Zarr 0.6 (RFC-5) can carry the rotation.
+                cls.addAffineToMultiscales(multiscales, affine)
+                ngff_zarr.to_ome_zarr(storePath, multiscales, version="0.6", overwrite=True)
             return multiscales
 
         if progress:
             progress(0, 1, f"Writing {os.path.basename(storePath)}")
         multiscales = runResponsive(write)
         version = str(getattr(multiscales.metadata, "version", "0.5") or "0.5")
+        if getattr(image, "_omezarrAffine", None) is not None:
+            version = "0.6"
         if isLabel:
             cls.addImageLabelMetadata(storePath, cls.imageLabelFromNode(node, version))
             cls.registerLabelInParent(storePath)
@@ -2284,6 +2379,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_ReadsKeepTheApplicationResponsive()
             self.test_Settings()
             self.test_CancelledLoadLeavesNothing()
+            self.test_ObliqueRoundTrip()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -2965,6 +3061,53 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         with self.assertRaises(InterruptedError):
             OMEZarrLogic.loadImage(storePath, level=0, progress=lambda done, total, text=None: False)
         self.assertEqual(slicer.mrmlScene.GetNumberOfNodes(), nodeCount)
+
+    def test_ObliqueRoundTrip(self):
+        self.delayDisplay("An oblique volume keeps its rotation (OME-Zarr 0.6 affine)")
+        import SampleData
+
+        mrHead = SampleData.SampleDataLogic().downloadMRHead()
+        oblique = slicer.modules.volumes.logic().CloneVolume(slicer.mrmlScene, mrHead, "oblique")
+        transform = vtk.vtkTransform()
+        transform.RotateX(17)
+        transform.RotateZ(-33)
+        rotation = vtk.vtkMatrix4x4()
+        transform.GetMatrix(rotation)
+        directions = np.zeros((3, 3))
+        mrHead.GetIJKToRASDirections(directions)
+        rotated = slicer.util.arrayFromVTKMatrix(rotation)[:3, :3] @ directions
+        oblique.SetIJKToRASDirections(rotated.tolist())
+
+        storePath = os.path.join(self.tempDir, "oblique.ome.zarr")
+        self.assertTrue(self.saveAsOmeZarr(oblique, storePath))
+        attributes = readStoreAttributes(storePath)
+        self.assertEqual(attributes["version"], "0.6")
+        [transformation] = attributes["multiscales"][0]["coordinateTransformations"]
+        self.assertEqual(transformation["type"], "affine")
+
+        OMEZarrLogic.clearCache()
+        loaded = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 0})
+        self.assertEqual(loaded.GetAttribute("OMEZarr.OrientationSource"), "rfc4+affine")
+        np.testing.assert_allclose(self.ijkToRasArray(loaded), self.ijkToRasArray(oblique), atol=1e-6)
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(loaded), slicer.util.arrayFromVolume(oblique))
+
+        # Coarser levels keep the same direction.
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        self.assertGreater(len(multiscales.images), 1)
+        coarse, _source = OMEZarrLogic.ijkToRasMatrix(multiscales.images[1])
+        fine = self.ijkToRasArray(oblique)
+        np.testing.assert_allclose(
+            coarse[:3, :3] / np.linalg.norm(coarse[:3, :3], axis=0),
+            fine[:3, :3] / np.linalg.norm(fine[:3, :3], axis=0),
+            atol=1e-6,
+        )
+
+        # An axis-aligned volume is still written as 0.5, without an affine.
+        alignedPath = os.path.join(self.tempDir, "aligned.ome.zarr")
+        self.assertTrue(self.saveAsOmeZarr(mrHead, alignedPath))
+        attributes = readStoreAttributes(alignedPath)
+        self.assertEqual(attributes["version"], "0.5")
+        self.assertNotIn("coordinateTransformations", attributes["multiscales"][0])
 
     def test_RemoteStore(self):
         self.delayDisplay("Remote HTTPS store (IDR)")
