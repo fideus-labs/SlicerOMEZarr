@@ -29,9 +29,7 @@ With this extension, in Slicer:
 * **Results other tools can read.** Volumes, label maps and segmentations are
   saved as multiscale OME-Zarr, with orientation, label names and colours.
 
-https://github.com/user-attachments/assets/da9256d2-1c8a-4734-b562-e6e754b26ca0
-
-
+https://github.com/user-attachments/assets/76483610-aed6-435a-9ccc-1b703503ce29
 
 **[Watch the walkthrough video](Screenshots/SlicerOMEZarr-tutorial.mp4)** (1 min, with captions), recorded on
 a public two-photon image of GFP-labelled neurons in a marmoset cortex from the
