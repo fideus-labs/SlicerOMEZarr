@@ -99,7 +99,8 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
 * **Display units**: optionally shows lengths in the store's unit (µm, nm).
 * **Writing**: scalar volumes, label maps and segmentations as multiscale
   OME-Zarr, with RFC-4 orientation from the IJK→RAS matrix and `image-label`
-  names and colours from the colour table or the segments.
+  names and colours from the colour table or the segments. A scalar volume
+  can also be saved as a single `.ozx` file.
 * **Stores**: local directories, `.ozx` files, `https://` and `s3://`, and
   bioformats2raw containers (every image series is loaded). S3 is read
   anonymously unless credentials are given in the environment
