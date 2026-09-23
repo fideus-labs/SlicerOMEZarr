@@ -12,6 +12,7 @@ Registers:
 NGFF parsing, multiscales, store access and RFC-4 orientation come from ngff-zarr.
 """
 
+import functools
 import json
 import logging
 import os
@@ -278,6 +279,23 @@ def runResponsive(work, onTick=None):
     return outcome.get("result")
 
 
+def removesNodesWhenCancelled(function):
+    """Remove the nodes ``function`` added to the scene when it is cancelled (InterruptedError)."""
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        before = {node.GetID() for node in slicer.util.getNodesByClass("vtkMRMLNode")}
+        try:
+            return function(*args, **kwargs)
+        except InterruptedError:
+            for node in slicer.util.getNodesByClass("vtkMRMLNode"):
+                if node.GetID() not in before and node.GetScene() is not None:  # display nodes go with their volume
+                    slicer.mrmlScene.RemoveNode(node)
+            raise
+
+    return wrapper
+
+
 #
 # Progress reporting
 #
@@ -286,28 +304,52 @@ def runResponsive(work, onTick=None):
 class Progress:
     """Progress dialog with a cancel button when the GUI is up; silent otherwise.
 
-    Used as ``progress(done, total, text)``; returns False once the user cancelled.
+    Used as ``progress(done, total, text)``; returns False once the user cancelled. While Slicer's
+    IO manager loads ``fileName``, its own dialog is driven instead of opening a second one.
     """
 
-    def __init__(self, label):
+    def __init__(self, label, fileName=None):
         self.label = label
+        self.fileName = fileName
         self.dialog = None
+        self.owned = False
 
     def __enter__(self):
         if slicer.util.mainWindow() and not slicer.app.testingEnabled():
-            self.dialog = slicer.util.createProgressDialog(labelText=self.label, windowTitle=_("OME-Zarr"), maximum=100)
+            self.dialog = self.ioManagerDialog()
+            if self.dialog is None:
+                self.dialog = slicer.util.createProgressDialog(
+                    labelText=self.label, windowTitle=_("OME-Zarr"), maximum=100
+                )
+                self.owned = True
+            else:
+                self.dialog.setCancelButtonText(_("Cancel"))  # Slicer leaves it out for a single file
         return self
+
+    def ioManagerDialog(self):
+        """The dialog the IO manager opens around a load, labelled with the file name."""
+        if not self.fileName:
+            return None
+        return next(
+            (
+                widget
+                for widget in slicer.app.topLevelWidgets()
+                if isinstance(widget, qt.QProgressDialog) and self.fileName in widget.labelText
+            ),
+            None,
+        )
 
     def __call__(self, done, total, text=None):
         if self.dialog is None:
             return True
-        self.dialog.value = int(100 * done / max(1, total))
+        if self.dialog.maximum == 100:  # with several files, the IO manager's bar counts files
+            self.dialog.value = min(99, int(100 * done / max(1, total)))  # 100 resets and hides the dialog
         if text:
             self.dialog.labelText = text
         return not self.dialog.wasCanceled
 
     def __exit__(self, *args):
-        if self.dialog is not None:
+        if self.owned:
             self.dialog.close()
         return False
 
@@ -717,6 +759,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     # ---- loading ----
 
     @classmethod
+    @removesNodesWhenCancelled
     def loadImage(
         cls,
         path,
@@ -1574,7 +1617,7 @@ class OMEZarrFileReader:
                 value = properties.get(key)
                 return cast(value) if value not in (None, "") else None
 
-            with Progress(_("Loading OME-Zarr...")) as progress:
+            with Progress(_("Loading OME-Zarr..."), properties["fileName"]) as progress:
                 nodes = OMEZarrLogic.loadImage(
                     root,
                     level=optional("level", int),
@@ -2240,6 +2283,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_WidgetInspectsByItself()
             self.test_ReadsKeepTheApplicationResponsive()
             self.test_Settings()
+            self.test_CancelledLoadLeavesNothing()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -2909,6 +2953,18 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(OMEZarrLogic.maxBytesFromSettings(), FALLBACK_MAX_BYTES // 16)
         Settings.set(Settings.MAX_BYTES, 12345)
         self.assertEqual(OMEZarrLogic.maxBytesFromSettings(), 12345)
+
+    def test_CancelledLoadLeavesNothing(self):
+        self.delayDisplay("A cancelled load removes the nodes it added")
+        import SampleData
+
+        mrHead = SampleData.SampleDataLogic().downloadMRHead()
+        storePath = os.path.join(self.tempDir, "cancelled.ome.zarr")
+        self.assertTrue(self.saveAsOmeZarr(mrHead, storePath))
+        nodeCount = slicer.mrmlScene.GetNumberOfNodes()
+        with self.assertRaises(InterruptedError):
+            OMEZarrLogic.loadImage(storePath, level=0, progress=lambda done, total, text=None: False)
+        self.assertEqual(slicer.mrmlScene.GetNumberOfNodes(), nodeCount)
 
     def test_RemoteStore(self):
         self.delayDisplay("Remote HTTPS store (IDR)")
