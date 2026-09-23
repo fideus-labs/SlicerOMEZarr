@@ -1510,6 +1510,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         """
         multiscales = cls.openMultiscales(path)
         shown = cls.sourceVolumeNode(path, 0, sliceViewName)
+        shownLevel = shown.GetAttribute("OMEZarr.Level") if shown is not None else None
+        if shownLevel == "0":
+            raise ValueError("Already at full resolution: the volume shown is level 0")
         bounds = cls.boundsInNodeFrame(cls.sliceViewRasBounds(sliceViewName), shown)
         budget = maxBytes or cls.maxBytesFromSettings()
         channels = len(cls.channelDescriptions(multiscales, multiscales.images[0]))
@@ -1525,7 +1528,6 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if chosen is None:
             raise ValueError("The view does not intersect the image, or no level fits the memory budget")
         level, region = chosen
-        shownLevel = shown.GetAttribute("OMEZarr.Level") if shown is not None else None
         if shownLevel is not None and level >= int(shownLevel):
             raise ValueError("Zoom in: no finer level than the one displayed fits the memory budget for this view")
         for node in cls.refinedNodes(path, sliceViewName):
@@ -3181,6 +3183,10 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         with self.assertRaises(ValueError):
             OMEZarrLogic.refineView(storePath, "Red", maxBytes=budget // 64)
         self.assertEqual(len(OMEZarrLogic.refinedNodes(storePath)), before)
+        full = OMEZarrLogic.loadImage(storePath, level=0)[0]
+        slicer.util.setSliceViewerLayers(background=full, fit=True)
+        with self.assertRaisesRegex(ValueError, "Already at full resolution"):
+            OMEZarrLogic.refineView(storePath, "Red")
 
     def test_StorageOptions(self):
         self.delayDisplay("Remote storage options: configured JSON, anonymous S3 unless credentials are given")
