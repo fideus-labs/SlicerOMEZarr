@@ -55,7 +55,7 @@ read from S3 (314 MiB at 0.5 µm). Step by step with screenshots: [TUTORIAL.md](
   ```
 
 Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
-0.46.1 or newer, is installed into Slicer's Python on first use.
+0.47.0 or newer, is installed into Slicer's Python on first use.
 
 ## What works
 
