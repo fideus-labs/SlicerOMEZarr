@@ -88,12 +88,14 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   system (affine, rotation, scale, sequence...) is applied too.
 * **Scenes** (OME-Zarr 0.6): every image of a scene is loaded, and each
   coordinate transformation between them becomes a Slicer transform node,
-  nested up to the scene's reference coordinate system. Affine transformations
-  become linear transforms; displacement fields, alone or in a sequence with
-  affines, become grid transforms. For a bijection, the inverse is used to
-  resample, so a field is never inverted numerically. The second image is shown
-  over the first at 50% opacity; refining a view and loading a region follow
-  the transforms.
+  nested up to the scene's reference coordinate system: the scene's first one,
+  else the input of its first transformation, the fixed image of a registration,
+  so the moving image is the one placed, through the transformation as stored.
+  Affine transformations become linear transforms; displacement fields, alone
+  or in a sequence with affines, become grid transforms, and are never inverted
+  numerically: a bijection's inverse serves the other direction. The second
+  image is shown over the first at 50% opacity; refining a view and loading a
+  region follow the transforms.
 * **Display units**: optionally shows lengths in the store's unit (µm, nm).
 * **Writing**: scalar volumes, label maps and segmentations as multiscale
   OME-Zarr, with RFC-4 orientation from the IJK→RAS matrix and `image-label`
