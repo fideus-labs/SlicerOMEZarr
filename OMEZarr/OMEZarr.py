@@ -209,12 +209,27 @@ def omeZarrRootFromPath(path):
     if not os.path.isdir(path):
         return None
     attrs = readStoreAttributes(path)
-    return path if attrs and ("multiscales" in attrs or "bioformats2raw.layout" in attrs) else None
+    return path if attrs and any(key in attrs for key in ("multiscales", "bioformats2raw.layout", "scene")) else None
 
 
 def isBioformats2rawRoot(root):
     attrs = readStoreAttributes(root)
     return bool(attrs and "bioformats2raw.layout" in attrs and "multiscales" not in attrs)
+
+
+def isSceneRoot(root):
+    """An OME-Zarr 0.6 scene: a group whose images share coordinate transformations."""
+    attrs = readStoreAttributes(root)
+    return bool(attrs and "scene" in attrs and "multiscales" not in attrs)
+
+
+def fieldPaths(transform):
+    """Paths of the displacement or coordinate fields a transformation reads, nested ones included."""
+    if transform.type in ("displacements", "coordinates"):
+        return {transform.path}
+    nested = [getattr(transform, side, None) for side in ("forward", "inverse")]
+    nested += [getattr(item, "transformation", item) for item in getattr(transform, "transformations", None) or []]
+    return set().union(*(fieldPaths(t) for t in nested if t is not None))
 
 
 def bioformats2rawSeries(root, limit=1000):
@@ -366,15 +381,15 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def ensureNgffZarr():
-        # From 0.46.1 on, ngff-zarr fills NgffImage.axes_orientations from the RFC-4 metadata on read.
-        # 0.47.0 writes OME-Zarr 0.6 (for oblique volumes) tagged "0.6"; 0.46.1 tags it "0.6rc0".
-        requirement = "ngff-zarr[remote]>=0.47.0"
+        # 0.51.0 reads OME-Zarr 0.6 scenes and converts RFC-5 sequences of affine and
+        # displacement field stages to ITK transforms.
+        requirement = "ngff-zarr[remote]>=0.51.0"
         if not slicer.packaging.pip_check(requirement):
             interactive = slicer.util.mainWindow() and not slicer.app.testingEnabled()
             if interactive and not slicer.util.confirmOkCancelDisplay(
-                _("ngff-zarr 0.47.0 or newer is required to read OME-Zarr images. Install it now?")
+                _("ngff-zarr 0.51.0 or newer is required to read OME-Zarr images. Install it now?")
             ):
-                raise RuntimeError("ngff-zarr 0.47.0 or newer is not installed")
+                raise RuntimeError("ngff-zarr 0.51.0 or newer is not installed")
             with slicer.util.tryWithErrorDisplay(_("Failed to install ngff-zarr"), waitCursor=True):
                 slicer.util.pip_install(requirement)
         import ngff_zarr
@@ -575,39 +590,65 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             source += "+affine"
         return toRas @ ijkToPhysical, source
 
-    @staticmethod
-    def attachAffine(multiscales):
-        """Attach an OME-Zarr 0.6 (RFC-5) intrinsic -> physical affine, as LPS (x,y,z) 4x4, to every level.
+    @classmethod
+    def attachAffine(cls, multiscales):
+        """Attach the first linear OME-Zarr 0.6 (RFC-5) transformation from the intrinsic coordinate
+        system, as an LPS (x,y,z) 4x4, and the name of the system it maps to, to every level.
 
-        Only a single affine (or rotation) whose input is the intrinsic coordinate system is used;
-        other transform chains are ignored, as before.
+        Non-linear transformations (displacement fields) of a multiscales are ignored.
         """
         metadata = multiscales.metadata
-        transforms = getattr(metadata, "coordinateTransformations", None) or []
         try:
-            intrinsic = metadata.intrinsic_coordinate_system.name
+            intrinsic = metadata.intrinsic_coordinate_system
         except Exception:  # noqa: BLE001 - not 0.6 metadata
             return
-        for transform in transforms:
-            if getattr(transform.input, "name", None) != intrinsic:
+        ngff_zarr = cls.ensureNgffZarr()
+        dims = [axis.name for axis in intrinsic.axes]
+        for transform in getattr(metadata, "coordinateTransformations", None) or []:
+            if getattr(transform.input, "name", None) != intrinsic.name:
                 continue
-            if transform.type == "affine" and transform.affine:
-                rows = np.asarray(transform.affine, dtype=float)
-            elif transform.type == "rotation" and transform.rotation:
-                rows = np.hstack([np.asarray(transform.rotation, dtype=float), np.zeros((3, 1))])
-            else:
+            try:
+                [affine] = cls.itkStages(ngff_zarr.ngff_transform_to_itk_transform(transform, dims))
+            except (NotImplementedError, ValueError):  # a field transform needs its field: not linear
                 continue
-            if rows.shape != (3, 4):
-                logging.warning(f"Ignoring OME-Zarr affine of shape {rows.shape}; only 3D is supported")
-                return
-            # Metadata arrays are (z, y, x); reorder to LPS (x, y, z).
-            order = [2, 1, 0]
-            affine = np.eye(4)
-            affine[:3, :3] = rows[:, :3][np.ix_(order, order)]
-            affine[:3, 3] = rows[order, 3]
             for image in multiscales.images:
                 image._omezarrAffine = affine
+                image._omezarrAffineOutput = transform.output.name
             return
+
+    @staticmethod
+    def itkStages(transforms):
+        """An ITK-Wasm transform list as the stages it applies, in order, on x,y,z numbers: a 4x4
+        array per affine (a 2D one gets an identity z), a vtkOrientedGridTransform per displacement field."""
+        from vtk.util import numpy_support
+
+        stages = []
+        for entry in reversed(transforms):  # ITK applies the last entry first
+            kind = getattr(entry.transformType.transformParameterization, "value", None)
+            parameters = np.asarray(entry.parameters, dtype=float)
+            fixed = np.asarray(entry.fixedParameters, dtype=float)
+            n = int(entry.transformType.inputDimension)
+            if kind == "Affine" and n in (2, 3):
+                matrix = parameters[: n * n].reshape(n, n)
+                center = fixed[:n]  # y = A (x - c) + t + c
+                stage = np.eye(4)
+                stage[:n, :n] = matrix
+                stage[:n, 3] = parameters[n * n :] + center - matrix @ center
+            elif kind == "DisplacementField" and n == 3:
+                grid = vtk.vtkImageData()
+                grid.SetDimensions(*fixed[:3].astype(int).tolist())
+                grid.SetOrigin(*fixed[3:6])
+                grid.SetSpacing(*fixed[6:9])
+                grid.GetPointData().SetScalars(numpy_support.numpy_to_vtk(parameters.reshape(-1, 3), deep=True))
+                direction = np.eye(4)
+                direction[:3, :3] = fixed[9:18].reshape(3, 3)
+                stage = slicer.vtkOrientedGridTransform()
+                stage.SetDisplacementGridData(grid)
+                stage.SetGridDirectionMatrix(slicer.util.vtkMatrixFromArray(direction))
+            else:
+                raise NotImplementedError(f"{n}D ITK {kind} transforms are not supported")
+            stages.append(stage)
+        return stages
 
     @classmethod
     def regionIjkToRas(cls, image, region=None, userMessages=None):
@@ -824,6 +865,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         ``timeIndex``: a single time point; otherwise the setting decides between a
         Sequence of all time points and index 0. ``labels``: also load the ``labels`` groups.
         """
+        if multiscales is None and isSceneRoot(path):
+            return cls.loadScene(path, level, timeIndex, name, maxBytes, userMessages, labels, timeMode, progress)
         if multiscales is None and isBioformats2rawRoot(path):
             series = bioformats2rawSeries(path)
             if not series:
@@ -970,6 +1013,159 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
         cls.applyDisplayUnits(lengthUnit)
         return nodes
+
+    # ---- scenes (OME-Zarr 0.6) ----
+
+    @classmethod
+    def loadScene(
+        cls,
+        root,
+        level=None,
+        timeIndex=None,
+        name=None,
+        maxBytes=None,
+        userMessages=None,
+        labels=None,
+        timeMode=None,
+        progress=None,
+    ):
+        """Load every image of a scene, each under the transform nodes that place it in the scene's
+        reference coordinate system (its first one, else the output of its first transformation).
+
+        Each transformation of the spanning tree from the reference becomes one transform node,
+        nested under the node of the system it maps into. Returns the loaded nodes, then the
+        transform nodes. The memory budget is shared equally between the images.
+        """
+        ngff_zarr = cls.ensureNgffZarr()
+        scene = ngff_zarr.from_ome_zarr(root, storage_options=cls.storageOptions(root), kind="scene")
+        if not scene.images:  # ngff-zarr finds the images through the transformations that reference them
+            raise ValueError("The scene's transformations reference no image")
+        budget = (maxBytes or cls.maxBytesFromSettings()) // len(scene.images)
+        imageNodes = {}
+        for path, multiscales in scene.images.items():
+            cls.attachAffine(multiscales)
+            imagePath = normalizeStorePath(joinStorePath(root, path))
+            cls._multiscalesCache[imagePath] = multiscales
+            imageNodes[path] = cls.loadImage(
+                imagePath,
+                level,
+                timeIndex,
+                name=f"{name}_{path}" if name else path,
+                maxBytes=budget,
+                userMessages=userMessages,
+                multiscales=multiscales,
+                labels=labels,
+                timeMode=timeMode,
+                progress=progress,
+            )
+
+        def end(reference):
+            return ("image", reference.path) if reference.path is not None else ("scene", reference.name)
+
+        transforms = scene.coordinateTransformations
+        reference = ("scene", scene.coordinateSystems[0].name) if scene.coordinateSystems else end(transforms[0].output)
+        transformNodes = {reference: None}
+        queue = [reference]
+        while queue:
+            parent = queue.pop(0)
+            for transform in transforms:
+                ends = (end(transform.input), end(transform.output))
+                if parent not in ends:
+                    continue
+                childIsInput = ends[1] == parent
+                child = ends[0] if childIsInput else ends[1]
+                if child in transformNodes:
+                    continue
+                transformNodes[child] = cls.addSceneTransformNode(
+                    transform, childIsInput, scene, root, transformNodes[parent]
+                )
+                queue.append(child)
+
+        nodes = []
+        for path, loaded in imageNodes.items():
+            key = ("image", path)
+            if key not in transformNodes:
+                message = f"Image '{path}' is not connected to the scene's reference coordinate system."
+                logging.warning(message)
+                if userMessages:
+                    userMessages.AddMessage(vtk.vtkCommand.WarningEvent, message)
+            elif transformNodes[key] is not None:
+                for node in loaded:
+                    if node.IsA("vtkMRMLTransformableNode"):
+                        node.SetAndObserveTransformNodeID(transformNodes[key].GetID())
+            nodes += loaded
+        return nodes + [node for node in transformNodes.values() if node is not None]
+
+    @classmethod
+    def addSceneTransformNode(cls, transform, childIsInput, scene, root, parentNode):
+        """Transform node of one scene transformation, placing its child end in its parent end.
+
+        A bijection's inverse is used when it maps the parent into the child: Slicer resamples
+        volumes with that direction, so a displacement field is then never inverted.
+        """
+        forward, inverse = transform, None
+        if transform.type == "bijection":
+            forward, inverse = transform.forward, transform.inverse
+        if childIsInput and inverse is not None:
+            mapping, source, target, toParent = inverse, transform.output, transform.input, False
+        else:
+            mapping, source, target, toParent = forward, transform.input, transform.output, childIsInput
+        dims, sourceToRas = cls.coordinateSystemToRas(source, scene)
+        _dims, targetToRas = cls.coordinateSystemToRas(target, scene)
+        fields = {path: cls.openMultiscales(joinStorePath(root, path)) for path in fieldPaths(mapping)}
+        ngff_zarr = cls.ensureNgffZarr()
+        stages = cls.itkStages(ngff_zarr.ngff_transform_to_itk_transform(mapping, dims, fields=fields or None))
+        stages = [np.linalg.inv(sourceToRas), *stages, targetToRas]
+        ends = (transform.input.path or transform.input.name, transform.output.path or transform.output.name)
+        name = slicer.mrmlScene.GenerateUniqueName(transform.name or "{} to {}".format(*ends))
+        if all(isinstance(stage, np.ndarray) for stage in stages):
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", name)
+            matrix = slicer.util.vtkMatrixFromArray(functools.reduce(lambda done, stage: stage @ done, stages))
+            setMatrix = node.SetMatrixTransformToParent if toParent else node.SetMatrixTransformFromParent
+            setMatrix(matrix)
+        else:
+            general = vtk.vtkGeneralTransform()
+            general.PostMultiply()  # concatenated transforms apply in order
+            for stage in stages:
+                general.Concatenate(slicer.util.vtkMatrixFromArray(stage) if isinstance(stage, np.ndarray) else stage)
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode", name)
+            setTransform = node.SetAndObserveTransformToParent if toParent else node.SetAndObserveTransformFromParent
+            setTransform(general)
+        if parentNode is not None:
+            node.SetAndObserveTransformNodeID(parentNode.GetID())
+        return node
+
+    @classmethod
+    def coordinateSystemToRas(cls, reference, scene):
+        """Axis names (Zarr order) of a scene transformation end, and the 4x4 from its x,y,z numbers to
+        the RAS millimetres Slicer shows it in: an image's own frame, or the scene's x/y/z as assumed axes."""
+        if reference.path is None:
+            system = next((s for s in scene.coordinateSystems or [] if s.name == reference.name), None)
+            if system is None:
+                raise ValueError(f"The scene does not declare the coordinate system '{reference.name}'")
+            units = {axis.name: axis.unit for axis in system.axes}
+            assumed = Settings.get(Settings.ORIENTATION, "LPS").upper()
+            toRas = np.eye(4) if assumed == "RAS" else np.diag([-1.0, -1.0, 1.0, 1.0])
+            factors = [LENGTH_UNIT_TO_MM.get(units.get(d), 1.0) for d in SPATIAL_DIMS]
+            return [axis.name for axis in system.axes], toRas @ np.diag([*factors, 1.0])
+        multiscales = scene.images[reference.path]
+        image = multiscales.images[0]
+        metadata = multiscales.metadata.to_version("0.6")
+        system = next((s for s in metadata.coordinateSystems if s.name == reference.name), None)
+        ijkToRas, _source = cls.ijkToRasMatrix(image)
+        indexToIntrinsic = np.eye(4)
+        for i, d in enumerate(SPATIAL_DIMS):
+            indexToIntrinsic[i, i] = image.scale.get(d, 1.0)
+            indexToIntrinsic[i, 3] = image.translation.get(d, 0.0)
+        toRas = ijkToRas @ np.linalg.inv(indexToIntrinsic)
+        if system is not None and reference.name == metadata.intrinsic_coordinate_system.name:
+            return [axis.name for axis in system.axes], toRas
+        if system is not None and reference.name == getattr(image, "_omezarrAffineOutput", None):
+            return [axis.name for axis in system.axes], toRas @ np.linalg.inv(image._omezarrAffine)
+        raise ValueError(
+            f"Coordinate system '{reference.name}' of image '{reference.path}' is neither its intrinsic system "
+            "nor the output of its first linear transformation"
+        )
 
     @staticmethod
     def rasBoundsOfRegion(image, region, ijkToRas):
@@ -1159,8 +1355,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         multiscales = cls.openMultiscales(path)
         bounds = [0.0] * 6
         roiNode.GetRASBounds(bounds)
-        region = cls.regionFromRasBounds(multiscales.images[int(level)], bounds)
-        return cls.loadImage(
+        source = cls.sourceVolumeNode(path, 0)
+        region = cls.regionFromRasBounds(multiscales.images[int(level)], cls.boundsInNodeFrame(bounds, source))
+        nodes = cls.loadImage(
             path,
             level=level,
             timeIndex=timeIndex,
@@ -1171,6 +1368,38 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             multiscales=multiscales,
             progress=progress,
         )
+        cls.placeLike(nodes, source)
+        return nodes
+
+    @staticmethod
+    def boundsInNodeFrame(rasBounds, node):
+        """World RAS bounds as bounds in the frame ``node`` is loaded in, before its parent transforms.
+
+        ponytail: only the 8 corners are mapped, so a block under a strongly warping (non-linear)
+        transform can come out a little small; sample the faces if that shows.
+        """
+        parent = node.GetParentTransformNode() if node is not None else None
+        if parent is None:
+            return rasBounds
+        fromWorld = vtk.vtkGeneralTransform()
+        parent.GetTransformFromWorld(fromWorld)
+        corners = np.array(
+            [
+                fromWorld.TransformPoint([rasBounds[i], rasBounds[2 + j], rasBounds[4 + k]])
+                for i in (0, 1)
+                for j in (0, 1)
+                for k in (0, 1)
+            ]
+        )
+        return [value for axis in range(3) for value in (corners[:, axis].min(), corners[:, axis].max())]
+
+    @staticmethod
+    def placeLike(nodes, reference):
+        """Put ``nodes`` under the transform of ``reference`` (a volume of the same store)."""
+        transformId = reference.GetTransformNodeID() if reference is not None else None
+        for node in nodes:
+            if transformId and node.IsA("vtkMRMLTransformableNode"):
+                node.SetAndObserveTransformNodeID(transformId)
 
     # ---- view-driven refinement ----
 
@@ -1264,7 +1493,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         previous block of the same view and store is replaced. Returns the new nodes.
         """
         multiscales = cls.openMultiscales(path)
-        bounds = cls.sliceViewRasBounds(sliceViewName)
+        shown = cls.sourceVolumeNode(path, 0, sliceViewName)
+        bounds = cls.boundsInNodeFrame(cls.sliceViewRasBounds(sliceViewName), shown)
         budget = maxBytes or cls.maxBytesFromSettings()
         channels = len(cls.channelDescriptions(multiscales, multiscales.images[0]))
         chosen = None
@@ -1279,7 +1509,6 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if chosen is None:
             raise ValueError("The view does not intersect the image, or no level fits the memory budget")
         level, region = chosen
-        shown = cls.sourceVolumeNode(path, 0, sliceViewName)
         shownLevel = shown.GetAttribute("OMEZarr.Level") if shown is not None else None
         if shownLevel is not None and level >= int(shownLevel):
             raise ValueError("Zoom in: no finer level than the one displayed fits the memory budget for this view")
@@ -1299,6 +1528,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             multiscales=multiscales,
             progress=progress,
         )
+        cls.placeLike(nodes, shown)
         scalars, labels = [], []
         for node in nodes:
             node.SetAttribute("OMEZarr.Refined", "1")
@@ -1739,14 +1969,22 @@ class OMEZarrFileReader:
         if properties.get("show", True) and nodes:
             scalars = scalarVolumes(nodes)
             labels = labelMaps(nodes)
+            shownPath = scalars[0].GetAttribute("OMEZarr.Path") if scalars else None
+            # A second image of a scene goes over the first, half transparent, to show how they align
+            # (not the series of a bioformats2raw container, which share no coordinate system).
+            other = None
+            if isSceneRoot(root):
+                other = next((n for n in scalars if not samePath(n.GetAttribute("OMEZarr.Path"), shownPath)), None)
             slicer.util.setSliceViewerLayers(
                 background=scalars[0] if scalars else "keep-current",
+                foreground=other or "keep-current",
+                foregroundOpacity=0.5 if other else None,
                 label=labels[0] if labels else "keep-current",
                 fit=True,
             )
             coarse = any(n.GetAttribute("OMEZarr.Level") not in (None, "0") for n in scalars)
             if coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
-                OMEZarrLogic.startAutoRefine(root)
+                OMEZarrLogic.startAutoRefine(shownPath)
         self.parent.loadedNodes = [node.GetID() for node in nodes]
         return True
 
@@ -2108,11 +2346,12 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
     def updateButtons(self):
         hasStore = self.path is not None
-        self.loadButton.setEnabled(hasStore and self.selectedLevel() >= 0)
-        self.refineButton.setEnabled(hasStore)
-        self.createRoiButton.setEnabled(hasStore)
-        self.autoRefineCheckBox.setEnabled(hasStore)
-        self.loadRegionButton.setEnabled(hasStore and self.roiSelector.currentNode() is not None)
+        isImage = hasStore and self.multiscales is not None  # a scene is refined image by image
+        self.loadButton.setEnabled(hasStore and (self.selectedLevel() >= 0 or not isImage))
+        self.refineButton.setEnabled(isImage)
+        self.createRoiButton.setEnabled(isImage)
+        self.autoRefineCheckBox.setEnabled(isImage)
+        self.loadRegionButton.setEnabled(isImage and self.roiSelector.currentNode() is not None)
 
     def fitTableHeight(self):
         """Size the table to its rows so that it never shows an empty area."""
@@ -2128,10 +2367,14 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self._inspecting = True  # adding the path to the history re-emits currentPathChanged
         try:
             with slicer.util.tryWithErrorDisplay(_("Failed to open store"), waitCursor=True):
-                self.multiscales = self.logic.openMultiscales(path, useCache=False)
+                scene = isSceneRoot(path)
+                self.multiscales = None if scene else self.logic.openMultiscales(path, useCache=False)
                 self.path = path
                 self.pathEdit.addCurrentPathToHistory()
-                self.showLevels()
+                if scene:
+                    self.showScene()
+                else:
+                    self.showLevels()
         finally:
             self._inspecting = False
         self.updateButtons()
@@ -2180,6 +2423,21 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.levelTable.selectRow(self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings()))
         self.updateLevelStatus()
 
+    def showScene(self):
+        """A scene has no levels of its own: list its images; Load reads them all."""
+        ngff_zarr = self.logic.ensureNgffZarr()
+        scene = ngff_zarr.from_ome_zarr(self.path, storage_options=self.logic.storageOptions(self.path), kind="scene")
+        self.levelTable.setRowCount(0)
+        self.fitTableHeight()
+        self.timeIndexSpinBox.setRange(-1, 0)
+        self.timeIndexSpinBox.value = -1
+        self.timeIndexLabel.setVisible(False)
+        self.timeIndexSpinBox.setVisible(False)
+        self.infoLabel.text = _(
+            "Scene: {n} image(s) ({names}), {m} transformation(s). Load reads every image at the level the "
+            "memory budget selects, under the transforms that place it in the scene."
+        ).format(n=len(scene.images), names=", ".join(scene.images), m=len(scene.coordinateTransformations))
+
     @staticmethod
     def formatBytes(size):
         return f"{size / 2**30:.2f} GiB" if size >= 2**30 else f"{size / 2**20:.1f} MiB"
@@ -2213,9 +2471,9 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                     item.setToolTip(". ".join(notes))
 
     def onLoad(self):
-        if not self.path or self.selectedLevel() < 0:
+        if not self.path or (self.multiscales is not None and self.selectedLevel() < 0):
             return
-        properties = {"level": self.selectedLevel()}
+        properties = {"level": self.selectedLevel()} if self.multiscales is not None else {}
         if self.timeIndexSpinBox.value >= 0:
             properties["timeIndex"] = self.timeIndexSpinBox.value
         with slicer.util.tryWithErrorDisplay(_("Failed to load level"), waitCursor=True):
@@ -2381,6 +2639,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_Settings()
             self.test_CancelledLoadLeavesNothing()
             self.test_ObliqueRoundTrip()
+            self.test_SceneTransforms()
+            self.test_SceneDisplacementField()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -3109,6 +3369,146 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         attributes = readStoreAttributes(alignedPath)
         self.assertEqual(attributes["version"], "0.5")
         self.assertNotIn("coordinateTransformations", attributes["multiscales"][0])
+
+    @staticmethod
+    def sceneImage(seed, translation):
+        """A small single-level 3D image in micrometres, for scene tests."""
+        import ngff_zarr
+
+        data = np.random.default_rng(seed).integers(1, 255, (6, 7, 8), dtype=np.uint8)
+        image = ngff_zarr.to_ngff_image(
+            data,
+            dims=("z", "y", "x"),
+            scale={"z": 2.0, "y": 1.0, "x": 0.5},
+            translation=dict(zip(("z", "y", "x"), translation, strict=True)),
+            axes_units={d: "micrometer" for d in "zyx"},
+        )
+        return ngff_zarr.to_multiscales(image, scale_factors=[])
+
+    @staticmethod
+    def worldPoint(volumeNode, ijk):
+        """World RAS of a voxel, through the volume's parent transforms."""
+        local = OMEZarrTest.ijkToRasArray(volumeNode) @ np.append(np.asarray(ijk, dtype=float), 1.0)
+        toWorld = vtk.vtkGeneralTransform()
+        slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(volumeNode.GetParentTransformNode(), None, toWorld)
+        return np.array(toWorld.TransformPoint(local[:3]))
+
+    @staticmethod
+    def expectedRas(numbersXyz):
+        """RAS millimetres of x,y,z numbers in micrometres, the x/y/z axes being LPS."""
+        return np.array([-1.0, -1.0, 1.0]) * np.asarray(numbersXyz, dtype=float) * 1e-3
+
+    def test_SceneTransforms(self):
+        self.delayDisplay("OME-Zarr 0.6 scene: images placed by linear transforms")
+        from ngff_zarr import CoordinateSystem, NgffScene
+        from ngff_zarr import CoordinateSystemIdentifier as Ref
+        from ngff_zarr.v06.zarr_metadata import Affine, Axis, Translation
+
+        world = CoordinateSystem(name="world", axes=[Axis(name=d, type="space", unit="micrometer") for d in "zyx"])
+        # a -> world, and world -> b: b sits at the output end, so its node is set from the parent.
+        toWorld = Translation(
+            translation=[0.0, 10.0, 20.0],
+            input=Ref(path="a", name="intrinsic"),
+            output=Ref(name="world"),
+            name="a to world",
+        )
+        rotation = [[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, -1.0, 2.0], [0.0, 1.0, 0.0, 3.0]]  # (z, y, x) rows
+        fromWorld = Affine(affine=rotation, input=Ref(name="world"), output=Ref(path="b", name="intrinsic"))
+        scene = NgffScene(
+            images={"a": self.sceneImage(0, (1.0, 0.0, 3.0)), "b": self.sceneImage(1, (0.0, -4.0, 2.0))},
+            coordinateTransformations=[toWorld, fromWorld],
+            coordinateSystems=[world],
+        )
+        storePath = os.path.join(self.tempDir, "scene.ome.zarr")
+        scene.to_ome_zarr(storePath)
+        self.assertEqual(omeZarrRootFromPath(storePath), storePath)
+
+        nodes = OMEZarrLogic.loadImage(storePath, level=0)
+        volumes = {n.GetName(): n for n in scalarVolumes(nodes)}
+        self.assertEqual(sorted(volumes), ["a", "b"])
+        transforms = [n for n in nodes if n.IsA("vtkMRMLTransformNode")]
+        self.assertEqual(len(transforms), 2)
+        self.assertEqual(volumes["a"].GetParentTransformNode().GetName(), "a to world")
+
+        # A voxel of a: intrinsic (scale, translation), then the translation, in LPS micrometres.
+        ijk = (2, 3, 4)
+        intrinsic = np.array([3.0 + 0.5 * 2, 0.0 + 1.0 * 3, 1.0 + 2.0 * 4])  # x, y, z
+        np.testing.assert_allclose(
+            self.worldPoint(volumes["a"], ijk), self.expectedRas(intrinsic + [20.0, 10.0, 0.0]), atol=1e-9
+        )
+        # A voxel of b: world = affine^-1 (intrinsic), the affine reordered to x, y, z.
+        affine = np.eye(4)
+        affine[:3, :3] = np.array(rotation)[:, :3][::-1, ::-1]
+        affine[:3, 3] = np.array(rotation)[::-1, 3]
+        intrinsic = np.array([2.0 + 0.5 * 2, -4.0 + 1.0 * 3, 0.0 + 2.0 * 4, 1.0])
+        np.testing.assert_allclose(
+            self.worldPoint(volumes["b"], ijk), self.expectedRas((np.linalg.inv(affine) @ intrinsic)[:3]), atol=1e-9
+        )
+
+        # A region given in world coordinates is read in the image's own frame, under its transform.
+        bounds = [0.0] * 6
+        volumes["a"].GetRASBounds(bounds)
+        roi = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode")
+        roi.SetCenter(*[(bounds[i] + bounds[i + 1]) / 2 for i in (0, 2, 4)])
+        roi.SetSize(*[bounds[i + 1] - bounds[i] for i in (0, 2, 4)])
+        imagePath = volumes["a"].GetAttribute("OMEZarr.Path")
+        [region] = scalarVolumes(OMEZarrLogic.loadRegion(imagePath, roi, level=0))
+        self.assertEqual(region.GetTransformNodeID(), volumes["a"].GetTransformNodeID())
+        self.assertEqual(region.GetImageData().GetDimensions(), volumes["a"].GetImageData().GetDimensions())
+
+    def test_SceneDisplacementField(self):
+        self.delayDisplay("OME-Zarr 0.6 scene: a bijection of displacement fields")
+        import dask.array as da
+        import ngff_zarr
+        from ngff_zarr import CoordinateSystemIdentifier as Ref
+        from ngff_zarr import NgffScene
+        from ngff_zarr.v06.zarr_metadata import Bijection, Displacements
+
+        storePath = os.path.join(self.tempDir, "registration.ome.zarr")
+        shift = np.array([1.0, 2.0, 3.0])  # (dz, dy, dx) micrometres
+        for name, sign in (("forward", 1.0), ("inverse", -1.0)):
+            vectors = np.broadcast_to((sign * shift)[:, None, None, None], (3, 6, 7, 8)).astype(np.float32)
+            field = ngff_zarr.NgffImage(
+                data=da.from_array(vectors),
+                dims=("c", "z", "y", "x"),
+                scale={"c": 1.0, "z": 2.0, "y": 1.0, "x": 0.5},
+                translation={"c": 0.0, "z": 0.0, "y": 0.0, "x": 0.0},
+                axes_units={d: "micrometer" for d in "zyx"},
+                axes_types={"c": ngff_zarr.AxisType.Displacement},
+            )
+            ngff_zarr.to_ome_zarr(
+                f"{storePath}/coordinateTransformations/{name}",
+                ngff_zarr.to_multiscales(field, scale_factors=[]),
+                version="0.6",
+            )
+        registration = Bijection(
+            forward=Displacements(path="coordinateTransformations/forward", interpolation="linear"),
+            inverse=Displacements(path="coordinateTransformations/inverse", interpolation="linear"),
+            input=Ref(path="moving", name="intrinsic"),
+            output=Ref(path="fixed", name="intrinsic"),
+            name="moving to fixed",
+        )
+        NgffScene(
+            images={"moving": self.sceneImage(0, (0.0, 0.0, 0.0)), "fixed": self.sceneImage(1, (0.0, 0.0, 0.0))},
+            coordinateTransformations=[registration],
+        ).to_ome_zarr(storePath, overwrite=False)
+
+        nodes = OMEZarrLogic.loadImage(storePath, level=0)
+        volumes = {n.GetName(): n for n in scalarVolumes(nodes)}
+        # Without scene coordinate systems the reference is the output: fixed stays in place.
+        self.assertIsNone(volumes["fixed"].GetParentTransformNode())
+        transform = volumes["moving"].GetParentTransformNode()
+        self.assertEqual(transform.GetName(), "moving to fixed")
+        self.assertFalse(transform.IsLinear())
+        # The inverse field is what maps the fixed (parent) frame into the moving one.
+        ijk = (3, 3, 2)
+        local = (self.ijkToRasArray(volumes["moving"]) @ np.append(ijk, 1.0))[:3]
+        fromWorld = vtk.vtkGeneralTransform()
+        transform.GetTransformFromWorld(fromWorld)
+        intrinsic = np.array([0.5 * 3, 1.0 * 3, 2.0 * 2])  # x, y, z
+        world = self.expectedRas(intrinsic + shift[::-1])
+        np.testing.assert_allclose(fromWorld.TransformPoint(world), local, atol=1e-9)
+        np.testing.assert_allclose(self.worldPoint(volumes["moving"], ijk), world, atol=1e-6)
 
     def test_RemoteStore(self):
         self.delayDisplay("Remote HTTPS store (IDR)")

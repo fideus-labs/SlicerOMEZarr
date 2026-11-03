@@ -55,7 +55,7 @@ read from S3 (314 MiB at 0.5 µm). Step by step with screenshots: [TUTORIAL.md](
   ```
 
 Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
-0.47.0 or newer, is installed into Slicer's Python on first use.
+0.51.0 or newer, is installed into Slicer's Python on first use.
 
 ## What works
 
@@ -84,6 +84,16 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   millimetres. RFC-4 anatomical orientation becomes the IJK→RAS direction.
   Without RFC-4 metadata the axes are assumed LPS (the ngff-zarr and ITK
   convention) or RAS, per the module settings, and the load log says so.
+  An OME-Zarr 0.6 (RFC-5) linear transformation from the intrinsic coordinate
+  system (affine, rotation, scale, sequence...) is applied too.
+* **Scenes** (OME-Zarr 0.6): every image of a scene is loaded, and each
+  coordinate transformation between them becomes a Slicer transform node,
+  nested up to the scene's reference coordinate system. Affine transformations
+  become linear transforms; displacement fields, alone or in a sequence with
+  affines, become grid transforms. For a bijection, the inverse is used to
+  resample, so a field is never inverted numerically. The second image is shown
+  over the first at 50% opacity; refining a view and loading a region follow
+  the transforms.
 * **Display units**: optionally shows lengths in the store's unit (µm, nm).
 * **Writing**: scalar volumes, label maps and segmentations as multiscale
   OME-Zarr, with RFC-4 orientation from the IJK→RAS matrix and `image-label`
