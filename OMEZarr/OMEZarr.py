@@ -1030,7 +1030,12 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         progress=None,
     ):
         """Load every image of a scene, each under the transform nodes that place it in the scene's
-        reference coordinate system (its first one, else the output of its first transformation).
+        reference coordinate system: its first one, else the input of its first transformation.
+
+        That input is the fixed image of a registration, whose transformation maps its points into
+        the moving image, the direction a resampler reads (ngff-zarr's ``resample`` takes it so): the
+        moving image then hangs under the transformation as Slicer's from-parent transform, and a
+        displacement field is applied as stored, never inverted.
 
         Each transformation of the spanning tree from the reference becomes one transform node,
         nested under the node of the system it maps into. Returns the loaded nodes, then the
@@ -1063,7 +1068,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             return ("image", reference.path) if reference.path is not None else ("scene", reference.name)
 
         transforms = scene.coordinateTransformations
-        reference = ("scene", scene.coordinateSystems[0].name) if scene.coordinateSystems else end(transforms[0].output)
+        reference = ("scene", scene.coordinateSystems[0].name) if scene.coordinateSystems else end(transforms[0].input)
         transformNodes = {reference: None}
         queue = [reference]
         while queue:
@@ -3481,32 +3486,35 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 ngff_zarr.to_multiscales(field, scale_factors=[]),
                 version="0.6",
             )
+        # As a registration writes it: from the fixed image to the moving one, the direction that
+        # resamples the moving image onto the fixed grid; the inverse field is there for the way back.
         registration = Bijection(
             forward=Displacements(path="coordinateTransformations/forward", interpolation="linear"),
             inverse=Displacements(path="coordinateTransformations/inverse", interpolation="linear"),
-            input=Ref(path="moving", name="intrinsic"),
-            output=Ref(path="fixed", name="intrinsic"),
-            name="moving to fixed",
+            input=Ref(path="fixed", name="intrinsic"),
+            output=Ref(path="moving", name="intrinsic"),
+            name="fixed to moving",
         )
         NgffScene(
-            images={"moving": self.sceneImage(0, (0.0, 0.0, 0.0)), "fixed": self.sceneImage(1, (0.0, 0.0, 0.0))},
+            images={"fixed": self.sceneImage(0, (0.0, 0.0, 0.0)), "moving": self.sceneImage(1, (0.0, 0.0, 0.0))},
             coordinateTransformations=[registration],
         ).to_ome_zarr(storePath, overwrite=False)
 
         nodes = OMEZarrLogic.loadImage(storePath, level=0)
         volumes = {n.GetName(): n for n in scalarVolumes(nodes)}
-        # Without scene coordinate systems the reference is the output: fixed stays in place.
+        # Without scene coordinate systems the reference is the input: the fixed image stays in place,
+        # and the moving one hangs under the transformation, the forward field as its from-parent map.
         self.assertIsNone(volumes["fixed"].GetParentTransformNode())
         transform = volumes["moving"].GetParentTransformNode()
-        self.assertEqual(transform.GetName(), "moving to fixed")
+        self.assertEqual(transform.GetName(), "fixed to moving")
         self.assertFalse(transform.IsLinear())
-        # The inverse field is what maps the fixed (parent) frame into the moving one.
+        # A point of the fixed (world) frame lands shift further in the moving one: the forward field, as stored.
         ijk = (3, 3, 2)
         local = (self.ijkToRasArray(volumes["moving"]) @ np.append(ijk, 1.0))[:3]
         fromWorld = vtk.vtkGeneralTransform()
         transform.GetTransformFromWorld(fromWorld)
         intrinsic = np.array([0.5 * 3, 1.0 * 3, 2.0 * 2])  # x, y, z
-        world = self.expectedRas(intrinsic + shift[::-1])
+        world = self.expectedRas(intrinsic - shift[::-1])
         np.testing.assert_allclose(fromWorld.TransformPoint(world), local, atol=1e-9)
         np.testing.assert_allclose(self.worldPoint(volumes["moving"], ijk), world, atol=1e-6)
 
