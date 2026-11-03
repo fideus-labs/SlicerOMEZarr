@@ -3421,7 +3421,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         )
         storePath = os.path.join(self.tempDir, "scene.ome.zarr")
         scene.to_ome_zarr(storePath)
-        self.assertEqual(omeZarrRootFromPath(storePath), storePath)
+        self.assertTrue(samePath(omeZarrRootFromPath(storePath), storePath))
 
         nodes = OMEZarrLogic.loadImage(storePath, level=0)
         volumes = {n.GetName(): n for n in scalarVolumes(nodes)}
