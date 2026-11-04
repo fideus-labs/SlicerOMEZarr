@@ -1143,16 +1143,27 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     @classmethod
     def coordinateSystemToRas(cls, reference, scene):
         """Axis names (Zarr order) of a scene transformation end, and the 4x4 from its x,y,z numbers to
-        the RAS millimetres Slicer shows it in: an image's own frame, or the scene's x/y/z as assumed axes."""
+        the RAS millimetres Slicer shows it in: an image's own frame, or a scene system's x/y/z, along their
+        RFC-4 orientation when every spatial axis has one (like an image's, about the origin), else assumed."""
+        from ngff_zarr.rfc4 import anatomical_orientation_to_itk_direction, axes_orientations_from_axes
+
         if reference.path is None:
             system = next((s for s in scene.coordinateSystems or [] if s.name == reference.name), None)
             if system is None:
                 raise ValueError(f"The scene does not declare the coordinate system '{reference.name}'")
-            units = {axis.name: axis.unit for axis in system.axes}
-            assumed = Settings.get(Settings.ORIENTATION, "LPS").upper()
-            toRas = np.eye(4) if assumed == "RAS" else np.diag([-1.0, -1.0, 1.0, 1.0])
-            factors = [LENGTH_UNIT_TO_MM.get(units.get(d), 1.0) for d in SPATIAL_DIMS]
-            return [axis.name for axis in system.axes], toRas @ np.diag([*factors, 1.0])
+            spatial = {axis.name: axis for axis in system.axes if axis.name in SPATIAL_DIMS}
+            orientations = axes_orientations_from_axes(system.axes) or {}  # the scene reader keeps them as dicts
+            direction = np.eye(4)
+            if spatial and all(d in orientations for d in spatial):
+                toRas = np.diag([-1.0, -1.0, 1.0, 1.0])
+                for column, d in enumerate(SPATIAL_DIMS):
+                    if d in spatial:
+                        direction[:3, column] = anatomical_orientation_to_itk_direction(orientations[d].value)
+            else:
+                assumed = Settings.get(Settings.ORIENTATION, "LPS").upper()
+                toRas = np.eye(4) if assumed == "RAS" else np.diag([-1.0, -1.0, 1.0, 1.0])
+            factors = [LENGTH_UNIT_TO_MM.get(spatial[d].unit if d in spatial else None, 1.0) for d in SPATIAL_DIMS]
+            return [axis.name for axis in system.axes], toRas @ direction @ np.diag([*factors, 1.0])
         multiscales = scene.images[reference.path]
         image = multiscales.images[0]
         metadata = multiscales.metadata.to_version("0.6")
@@ -2645,6 +2656,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_CancelledLoadLeavesNothing()
             self.test_ObliqueRoundTrip()
             self.test_SceneTransforms()
+            self.test_SceneOrientation()
             self.test_SceneDisplacementField()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
@@ -3460,6 +3472,52 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         [region] = scalarVolumes(OMEZarrLogic.loadRegion(imagePath, roi, level=0))
         self.assertEqual(region.GetTransformNodeID(), volumes["a"].GetTransformNodeID())
         self.assertEqual(region.GetImageData().GetDimensions(), volumes["a"].GetImageData().GetDimensions())
+
+    def test_SceneOrientation(self):
+        self.delayDisplay("OME-Zarr 0.6 scene: RFC-4 orientation of an image and of the scene's system")
+        import ngff_zarr
+        from ngff_zarr import CoordinateSystem, NgffScene
+        from ngff_zarr import CoordinateSystemIdentifier as Ref
+        from ngff_zarr.rfc4 import AnatomicalOrientation, anatomical_orientation_to_itk_direction
+        from ngff_zarr.rfc4 import AnatomicalOrientationValues as Values
+        from ngff_zarr.v06.zarr_metadata import Axis, Translation
+
+        orientations = {
+            "x": AnatomicalOrientation(value=Values.posterior_to_anterior),
+            "y": AnatomicalOrientation(value=Values.left_to_right),
+            "z": AnatomicalOrientation(value=Values.inferior_to_superior),
+        }
+        image = ngff_zarr.to_ngff_image(
+            np.ones((6, 7, 8), dtype=np.uint8),
+            dims=("z", "y", "x"),
+            scale={"z": 2.0, "y": 1.0, "x": 0.5},
+            translation={"z": 1.0, "y": 2.0, "x": 3.0},
+            axes_units={d: "micrometer" for d in "zyx"},
+        )
+        image.axes_orientations = orientations
+        world = CoordinateSystem(
+            name="world",
+            axes=[Axis(name=d, type="space", unit="micrometer", orientation=orientations[d]) for d in "zyx"],
+        )
+        toWorld = Translation(
+            translation=[5.0, 10.0, 20.0], input=Ref(path="head", name="intrinsic"), output=Ref(name="world")
+        )
+        storePath = os.path.join(self.tempDir, "oriented-scene.ome.zarr")
+        NgffScene(
+            images={"head": ngff_zarr.to_multiscales(image, scale_factors=[])},
+            coordinateTransformations=[toWorld],
+            coordinateSystems=[world],
+        ).to_ome_zarr(storePath)
+
+        [volume] = scalarVolumes(OMEZarrLogic.loadImage(storePath, level=0))
+        self.assertEqual(volume.GetAttribute("OMEZarr.OrientationSource"), "rfc4")
+        # The world's axes point where the image's do: a voxel lands at D (p + t), not at p + t.
+        direction = np.column_stack([anatomical_orientation_to_itk_direction(orientations[d].value) for d in "xyz"])
+        ijk = (2, 3, 4)
+        intrinsic = np.array([3.0 + 0.5 * 2, 2.0 + 1.0 * 3, 1.0 + 2.0 * 4])  # x, y, z
+        np.testing.assert_allclose(
+            self.worldPoint(volume, ijk), self.expectedRas(direction @ (intrinsic + [20.0, 10.0, 5.0])), atol=1e-9
+        )
 
     def test_SceneDisplacementField(self):
         self.delayDisplay("OME-Zarr 0.6 scene: a bijection of displacement fields")
