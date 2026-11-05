@@ -381,15 +381,15 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def ensureNgffZarr():
-        # 0.51.0 reads OME-Zarr 0.6 scenes and converts RFC-5 sequences of affine and
-        # displacement field stages to ITK transforms.
-        requirement = "ngff-zarr[remote]>=0.51.0"
+        # 0.52.0 reads a scene's affine stored as an array, the form it now writes, and converts
+        # RFC-5 sequences of affine and displacement field stages to ITK transforms.
+        requirement = "ngff-zarr[remote]>=0.52.0"
         if not slicer.packaging.pip_check(requirement):
             interactive = slicer.util.mainWindow() and not slicer.app.testingEnabled()
             if interactive and not slicer.util.confirmOkCancelDisplay(
-                _("ngff-zarr 0.51.0 or newer is required to read OME-Zarr images. Install it now?")
+                _("ngff-zarr 0.52.0 or newer is required to read OME-Zarr images. Install it now?")
             ):
-                raise RuntimeError("ngff-zarr 0.51.0 or newer is not installed")
+                raise RuntimeError("ngff-zarr 0.52.0 or newer is not installed")
             with slicer.util.tryWithErrorDisplay(_("Failed to install ngff-zarr"), waitCursor=True):
                 slicer.util.pip_install(requirement)
         import ngff_zarr
