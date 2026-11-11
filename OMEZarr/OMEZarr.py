@@ -1510,6 +1510,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         """
         multiscales = cls.openMultiscales(path)
         shown = cls.sourceVolumeNode(path, 0, sliceViewName)
+        shownLevel = shown.GetAttribute("OMEZarr.Level") if shown is not None else None
+        if shownLevel == "0":
+            raise ValueError("Already at full resolution: the volume shown is level 0")
         bounds = cls.boundsInNodeFrame(cls.sliceViewRasBounds(sliceViewName), shown)
         budget = maxBytes or cls.maxBytesFromSettings()
         channels = len(cls.channelDescriptions(multiscales, multiscales.images[0]))
@@ -1525,7 +1528,6 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if chosen is None:
             raise ValueError("The view does not intersect the image, or no level fits the memory budget")
         level, region = chosen
-        shownLevel = shown.GetAttribute("OMEZarr.Level") if shown is not None else None
         if shownLevel is not None and level >= int(shownLevel):
             raise ValueError("Zoom in: no finer level than the one displayed fits the memory budget for this view")
         for node in cls.refinedNodes(path, sliceViewName):
@@ -1735,6 +1737,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 if colorNode is not None:
                     slicer.mrmlScene.RemoveNode(colorNode)
         isLabel = node.IsA("vtkMRMLLabelMapVolumeNode")
+        if isLabel and str(storePath).lower().endswith(".ozx"):
+            raise ValueError("Label maps and segmentations are written as .ome.zarr directories, not .ozx files")
         image = cls.ngffImageFromVolumeNode(node)
         method = Methods.ITKWASM_LABEL_IMAGE if isLabel else None
 
@@ -2022,7 +2026,7 @@ class OMEZarrFileWriter:
 
     def extensions(self, obj):
         # The second, generic filter lets a label map be written as ``<image>/labels/<name>``.
-        return [_("OME-Zarr") + " (.ome.zarr)", _("OME-Zarr directory") + " (*)"]
+        return [_("OME-Zarr") + " (.ome.zarr)", _("OME-Zarr zip") + " (.ozx)", _("OME-Zarr directory") + " (*)"]
 
     def canWriteObjectConfidence(self, obj):
         # Below the default 0.5 so the native formats stay the default choice in the save dialog.
@@ -2654,6 +2658,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_ReadsKeepTheApplicationResponsive()
             self.test_Settings()
             self.test_CancelledLoadLeavesNothing()
+            self.test_OzxWriting()
             self.test_ObliqueRoundTrip()
             self.test_SceneTransforms()
             self.test_SceneOrientation()
@@ -3181,6 +3186,10 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         with self.assertRaises(ValueError):
             OMEZarrLogic.refineView(storePath, "Red", maxBytes=budget // 64)
         self.assertEqual(len(OMEZarrLogic.refinedNodes(storePath)), before)
+        full = OMEZarrLogic.loadImage(storePath, level=0)[0]
+        slicer.util.setSliceViewerLayers(background=full, fit=True)
+        with self.assertRaisesRegex(ValueError, "Already at full resolution"):
+            OMEZarrLogic.refineView(storePath, "Red")
 
     def test_StorageOptions(self):
         self.delayDisplay("Remote storage options: configured JSON, anonymous S3 unless credentials are given")
@@ -3386,6 +3395,23 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         attributes = readStoreAttributes(alignedPath)
         self.assertEqual(attributes["version"], "0.5")
         self.assertNotIn("coordinateTransformations", attributes["multiscales"][0])
+
+    def test_OzxWriting(self):
+        self.delayDisplay("A volume saved as .ozx is one file that reads back exactly")
+        import SampleData
+
+        mrHead = SampleData.SampleDataLogic().downloadMRHead()
+        path = os.path.join(self.tempDir, "single.ozx")
+        self.assertTrue(self.saveAsOmeZarr(mrHead, path))
+        self.assertTrue(os.path.isfile(path))
+        loaded = slicer.util.loadNodeFromFile(path, "OMEZarr", {"level": 0})
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(loaded), slicer.util.arrayFromVolume(mrHead))
+        np.testing.assert_allclose(self.ijkToRasArray(loaded), self.ijkToRasArray(mrHead), atol=1e-6)
+        labelNode = slicer.util.addVolumeFromArray(
+            np.ones((4, 4, 4), np.uint8), name="mask", nodeClassName="vtkMRMLLabelMapVolumeNode"
+        )
+        with self.assertRaisesRegex(ValueError, "not .ozx"):
+            OMEZarrLogic.writeVolume(labelNode, os.path.join(self.tempDir, "mask.ozx"))
 
     @staticmethod
     def sceneImage(seed, translation):
